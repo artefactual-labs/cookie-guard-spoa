@@ -1,13 +1,25 @@
-// JS cookie challenge SPOA for HAProxy (Negasus library version).
-// - Message "issue-token": sets txn.js.token and txn.js.max_age
-// - Message "verify-token": sets txn.js.valid ("1"/"0")
+// JS cookie challenge SPOE for HAProxy (Negasus library).
 //
-// Token = base64url(payload) + "." + base64url(HMAC_SHA256(secret, payload))
-// payload = ip|ua_sha1|iat|exp|nonce
+// Endpoints (metrics listener):
+//   - /healthz  : liveness probe -> "ok"
+//   - /metrics  : Prometheus metrics
 //
-// Build:  go build -trimpath -ldflags="-s -w" -o bin/js-spoa ./cmd/js-spoa
-// Run:    ./bin/js-spoa -listen 127.0.0.1:9903 -metrics 127.0.0.1:9904 -secret /etc/js-spoa/secret.key -ttl 1h
-
+// Metrics exposed:
+//   - js_spoa_issue_total
+//   - js_spoa_verify_total
+//   - js_spoa_verify_outcome_total{outcome="valid"|"invalid"}
+//   - js_spoa_handler_seconds_bucket|sum|count{message="issue-token"|"verify-token"}
+//   - js_spoa_build_info{version="<ldflags-set>"}
+//
+// Build (embed version):
+//   go build -trimpath -ldflags "-s -w -X 'main.version=$(git describe --tags --always || echo dev)'" -o bin/js-spoa ./cmd/js-spoa
+//
+// Run (dev):
+//   ./bin/js-spoa -listen 127.0.0.1:9903 -metrics 127.0.0.1:9904 -secret /etc/js-spoa/secret.key -ttl 1h
+//
+// Token details:
+//   token = base64url(payload) + "." + base64url(HMAC_SHA256(secret, payload))
+//   payload = ip|ua_sha1|iat|exp|nonce
 package main
 
 import (
@@ -36,8 +48,15 @@ import (
 	"github.com/negasus/haproxy-spoe-go/agent"
 	"github.com/negasus/haproxy-spoe-go/logger"
 	"github.com/negasus/haproxy-spoe-go/request"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// Version is set at build time with -ldflags "-X 'main.version=...'"
+var version = "dev"
+
+// CLI flags
 var (
 	listenAddr  = flag.String("listen", "127.0.0.1:9903", "SPOE listen address")
 	metricsAddr = flag.String("metrics", "127.0.0.1:9904", "Metrics/health listen address (empty to disable)")
@@ -46,11 +65,48 @@ var (
 	skew        = flag.Duration("skew", 30*time.Second, "Clock skew allowance")
 )
 
+// Secret storage (atomic swap on SIGHUP)
 type secrets struct{ primary []byte }
 
 var sec atomic.Pointer[secrets]
 
-// --- helpers ---
+// ---------------- Prometheus metrics ----------------
+
+var (
+	// Counters
+	mIssueTotal  = prometheus.NewCounter(prometheus.CounterOpts{Name: "js_spoa_issue_total", Help: "Total number of issued challenge tokens"})
+	mVerifyTotal = prometheus.NewCounter(prometheus.CounterOpts{Name: "js_spoa_verify_total", Help: "Total number of verify requests"})
+
+	// CounterVec with outcome label for verification
+	mVerifyOutcome = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "js_spoa_verify_outcome_total",
+			Help: "Verify outcomes by result",
+		},
+		[]string{"outcome"}, // "valid" or "invalid"
+	)
+
+	// Handler latency histograms
+	mHandlerSeconds = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "js_spoa_handler_seconds",
+			Help:    "Time spent handling SPOE messages",
+			Buckets: prometheus.DefBuckets, // 5ms .. 10s typical
+		},
+		[]string{"message"}, // "issue-token" or "verify-token"
+	)
+
+	// Build info gauge
+	mBuildInfo = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "js_spoa_build_info",
+			Help: "Build information",
+		},
+		[]string{"version"},
+	)
+)
+
+// ---------------- helpers ----------------
 
 func loadSecret(path string) ([]byte, error) {
 	if path == "" {
@@ -68,9 +124,8 @@ func loadSecret(path string) ([]byte, error) {
 }
 
 func b64url(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
-func b64urldec(s string) ([]byte, error) {
-	return base64.RawURLEncoding.DecodeString(s)
-}
+
+func b64urldec(s string) ([]byte, error) { return base64.RawURLEncoding.DecodeString(s) }
 
 func randNonce(n int) (string, error) {
 	buf := make([]byte, n)
@@ -93,7 +148,7 @@ func sign(secret []byte, payload string) []byte {
 
 func nowUnix() int64 { return time.Now().Unix() }
 
-// --- token issue / verify ---
+// ---------------- token issue / verify ----------------
 
 func issueToken(ip, ua string) (token string, maxAgeSec int, err error) {
 	if ip == "" {
@@ -159,12 +214,13 @@ func verifyToken(ip, ua, token string, skewSec int64) bool {
 	return hmac.Equal(want, got)
 }
 
-// --- Negasus handler ---
+// ---------------- Negasus handler ----------------
 
 func makeHandler() func(*request.Request) {
 	return func(req *request.Request) {
-		// Handle "issue-token"
+		// "issue-token"
 		if mes, err := req.Messages.GetByName("issue-token"); err == nil {
+			tStart := time.Now()
 			var ipStr, ua string
 			if v, ok := mes.KV.Get("src-ip"); ok {
 				switch t := v.(type) {
@@ -183,16 +239,22 @@ func makeHandler() func(*request.Request) {
 			if err == nil {
 				req.Actions.SetVar(action.ScopeTransaction, "js.token", tok)
 				req.Actions.SetVar(action.ScopeTransaction, "js.max_age", fmt.Sprintf("%d", maxAge))
+				if tok != "" {
+					mIssueTotal.Inc()
+				}
 			} else {
-				// On error, set empty values; HAProxy will treat as "no token"
 				req.Actions.SetVar(action.ScopeTransaction, "js.token", "")
 				req.Actions.SetVar(action.ScopeTransaction, "js.max_age", "0")
 			}
+			mHandlerSeconds.WithLabelValues("issue-token").Observe(time.Since(tStart).Seconds())
 		}
 
-		// Handle "verify-token"
+		// "verify-token"
 		if mes, err := req.Messages.GetByName("verify-token"); err == nil {
+			tStart := time.Now()
 			var ipStr, ua, cookie string
+			mVerifyTotal.Inc()
+
 			if v, ok := mes.KV.Get("src-ip"); ok {
 				switch t := v.(type) {
 				case net.IP:
@@ -211,14 +273,21 @@ func makeHandler() func(*request.Request) {
 					cookie = s
 				}
 			}
+
 			valid := "0"
 			if verifyToken(ipStr, ua, cookie, int64(skew.Seconds())) {
 				valid = "1"
+				mVerifyOutcome.WithLabelValues("valid").Inc()
+			} else {
+				mVerifyOutcome.WithLabelValues("invalid").Inc()
 			}
 			req.Actions.SetVar(action.ScopeTransaction, "js.valid", valid)
+			mHandlerSeconds.WithLabelValues("verify-token").Observe(time.Since(tStart).Seconds())
 		}
 	}
 }
+
+// ---------------- main ----------------
 
 func main() {
 	flag.Parse()
@@ -230,7 +299,7 @@ func main() {
 	}
 	sec.Store(&secrets{primary: b})
 
-	// Handle signals (HUP to reload secret)
+	// Signals
 	sigc := make(chan os.Signal, 2)
 	signal.Notify(sigc, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -250,34 +319,42 @@ func main() {
 		}
 	}()
 
-	// Start SPOE agent (Negasus style)
+	// Start SPOE agent
 	ln, err := net.Listen("tcp4", *listenAddr)
 	if err != nil {
 		log.Fatalf("listen %s: %v", *listenAddr, err)
 	}
 	defer ln.Close()
 
+	log.Printf("js-spoa %s listening on %s (metrics: %s)", version, *listenAddr, *metricsAddr)
+
 	h := makeHandler()
 	a := agent.New(h, logger.NewDefaultLog())
 
-	// Optional metrics/health (plain HTTP on localhost)
+	// Metrics server
 	if *metricsAddr != "" {
+		// register metrics
+		prometheus.MustRegister(mIssueTotal, mVerifyTotal, mVerifyOutcome, mHandlerSeconds, mBuildInfo)
+		mBuildInfo.WithLabelValues(version).Set(1)
+
 		go func() {
 			mux := http.NewServeMux()
+			mux.Handle("/metrics", promhttp.Handler())
 			mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte("ok\n"))
 			})
-			_ = http.ListenAndServe(*metricsAddr, mux)
+			if err := http.ListenAndServe(*metricsAddr, mux); err != nil {
+				log.Printf("metrics server error: %v", err)
+			}
 		}()
 	}
 
-	// Serve
+	// Serve (blocking)
 	if err := a.Serve(ln); err != nil {
 		log.Fatalf("agent serve: %v", err)
 	}
 
-	// keep main alive (Serve is blocking; this is just for symmetry)
 	<-context.Background().Done()
 }
 
