@@ -16,6 +16,9 @@
 # Keep go.sum under version control for reproducible builds
 !/go.sum
 
+# Keep go.mod under version control
+!/go.mod
+
 /vendor/
 
 # ====================================================================
