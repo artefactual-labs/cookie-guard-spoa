@@ -1,0 +1,36 @@
+[Install]
+WantedBy=multi-user.target
+
+
+[Unit]
+Description=HAProxy JS Cookie Challenge SPOE (Go, localhost, single-secret)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Listen ONLY on localhost; no TLS, plain TCP.
+ExecStart=/usr/local/bin/js-spoa \
+  -listen 127.0.0.1:9903 \
+  -metrics 127.0.0.1:9904 \
+  -secret /etc/js-spoa/secret.key \
+  -ttl 1h
+
+# Run unprivileged
+User=nobody
+Group=nogroup
+
+Restart=on-failure
+RestartSec=2
+
+# Hardening (safe with localhost-only)
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target
+

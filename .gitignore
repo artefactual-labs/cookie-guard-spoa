@@ -1,0 +1,52 @@
+# ====================================================================
+# Go build & module artifacts
+# ====================================================================
+
+# Compiled binaries
+/bin/
+/build/
+/dist/
+/cover.out
+*.test
+*.out
+
+# Module caches / temporary Go files
+*.mod
+*.sum~
+# Keep go.sum under version control for reproducible builds
+!/go.sum
+
+/vendor/
+
+# ====================================================================
+# Systemd / runtime state
+# ====================================================================
+
+# Local runtime data or secrets (never commit!)
+/etc/js-spoa/secret.key
+/etc/js-spoa/secret2.key
+/tmp/
+/run/
+/var/
+
+# ====================================================================
+# Development environment & editors
+# ====================================================================
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.env
+.env.*
+
+# ====================================================================
+# Test data & local experiments
+# ====================================================================
+
+/testdata/
+/examples/
+/scratch/
+/local/
+
