@@ -26,7 +26,7 @@ This effectively blocks:
 
 ---
 
-## ⚙️ Features
+## Features
 
 - Pure Go binary (no runtime or virtualenv)
 - **Single secret file** for signing tokens
