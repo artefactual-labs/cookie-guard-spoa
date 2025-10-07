@@ -206,7 +206,7 @@ func verifyToken(ip, ua, token string, skewSec int64) bool {
 	if s == nil || len(s.primary) == 0 {
 		return false
 	}
-	want := sign(s.primary, parts[0])
+	want := sign(s.primary, payload)
 	got, err := b64urldec(parts[1])
 	if err != nil {
 		return false
