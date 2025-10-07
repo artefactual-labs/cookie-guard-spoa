@@ -237,14 +237,14 @@ func makeHandler() func(*request.Request) {
 			}
 			tok, maxAge, err := issueToken(ipStr, ua)
 			if err == nil {
-				req.Actions.SetVar(action.ScopeTransaction, "js.token", tok)
-				req.Actions.SetVar(action.ScopeTransaction, "js.max_age", fmt.Sprintf("%d", maxAge))
+				req.Actions.SetVar(action.ScopeTransaction, "token", tok)
+				req.Actions.SetVar(action.ScopeTransaction, "max_age", fmt.Sprintf("%d", maxAge))
 				if tok != "" {
 					mIssueTotal.Inc()
 				}
 			} else {
-				req.Actions.SetVar(action.ScopeTransaction, "js.token", "")
-				req.Actions.SetVar(action.ScopeTransaction, "js.max_age", "0")
+				req.Actions.SetVar(action.ScopeTransaction, "token", "")
+				req.Actions.SetVar(action.ScopeTransaction, "max_age", "0")
 			}
 			mHandlerSeconds.WithLabelValues("issue-token").Observe(time.Since(tStart).Seconds())
 		}
@@ -281,7 +281,7 @@ func makeHandler() func(*request.Request) {
 			} else {
 				mVerifyOutcome.WithLabelValues("invalid").Inc()
 			}
-			req.Actions.SetVar(action.ScopeTransaction, "js.valid", valid)
+			req.Actions.SetVar(action.ScopeTransaction, "valid", valid)
 			mHandlerSeconds.WithLabelValues("verify-token").Observe(time.Since(tStart).Seconds())
 		}
 	}
