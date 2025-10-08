@@ -39,6 +39,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -58,11 +59,12 @@ var version = "dev"
 
 // CLI flags
 var (
-	listenAddr  = flag.String("listen", "127.0.0.1:9903", "SPOE listen address")
-	metricsAddr = flag.String("metrics", "127.0.0.1:9904", "Metrics/health listen address (empty to disable)")
-	secretPath  = flag.String("secret", "/etc/js-spoa/secret.key", "Primary secret file path")
-	ttl         = flag.Duration("ttl", 1*time.Hour, "Token TTL (e.g., 1h)")
-	skew        = flag.Duration("skew", 30*time.Second, "Clock skew allowance")
+	listenAddr       = flag.String("listen", "127.0.0.1:9903", "SPOE listen address")
+	metricsAddr      = flag.String("metrics", "127.0.0.1:9904", "Metrics/health listen address (empty to disable)")
+	secretPath       = flag.String("secret", "/etc/js-spoa/secret.key", "Primary secret file path")
+	ttl              = flag.Duration("ttl", 1*time.Hour, "Token TTL (e.g., 1h)")
+	skew             = flag.Duration("skew", 30*time.Second, "Clock skew allowance")
+	expectedTokenLen = flag.Int("expected-len", 0, "If >0 enforce exact token length (for stricter validation)")
 )
 
 // Secret storage (atomic swap on SIGHUP)
@@ -73,30 +75,26 @@ var sec atomic.Pointer[secrets]
 // ---------------- Prometheus metrics ----------------
 
 var (
-	// Counters
 	mIssueTotal  = prometheus.NewCounter(prometheus.CounterOpts{Name: "js_spoa_issue_total", Help: "Total number of issued challenge tokens"})
 	mVerifyTotal = prometheus.NewCounter(prometheus.CounterOpts{Name: "js_spoa_verify_total", Help: "Total number of verify requests"})
 
-	// CounterVec with outcome label for verification
 	mVerifyOutcome = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "js_spoa_verify_outcome_total",
 			Help: "Verify outcomes by result",
 		},
-		[]string{"outcome"}, // "valid" or "invalid"
+		[]string{"outcome"},
 	)
 
-	// Handler latency histograms
 	mHandlerSeconds = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "js_spoa_handler_seconds",
 			Help:    "Time spent handling SPOE messages",
-			Buckets: prometheus.DefBuckets, // 5ms .. 10s typical
+			Buckets: prometheus.DefBuckets,
 		},
-		[]string{"message"}, // "issue-token" or "verify-token"
+		[]string{"message"},
 	)
 
-	// Build info gauge
 	mBuildInfo = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "js_spoa_build_info",
@@ -162,11 +160,15 @@ func issueToken(ip, ua string) (token string, maxAgeSec int, err error) {
 		return "", 0, err
 	}
 	payload := fmt.Sprintf("%s|%s|%d|%d|%s", ip, uah, iat, exp, nonce)
+
 	s := sec.Load()
 	if s == nil || len(s.primary) == 0 {
 		return "", 0, errors.New("no secret loaded")
 	}
+
+	// HMAC over the *raw payload*
 	sig := b64url(sign(s.primary, payload))
+
 	return b64url([]byte(payload)) + "." + sig, int(*ttl / time.Second), nil
 }
 
@@ -178,11 +180,19 @@ func verifyToken(ip, ua, token string, skewSec int64) bool {
 	if len(parts) != 2 {
 		return false
 	}
-	raw, err := b64urldec(parts[0])
+
+	// decode payload and signature
+	rawPayload, err := b64urldec(parts[0])
 	if err != nil {
 		return false
 	}
-	payload := string(raw) // ip|ua_sha1|iat|exp|nonce
+	gotSig, err := b64urldec(parts[1])
+	if err != nil {
+		return false
+	}
+
+	// parse payload
+	payload := string(rawPayload) // ip|ua_sha1|iat|exp|nonce
 	ps := strings.Split(payload, "|")
 	if len(ps) != 5 {
 		return false
@@ -191,6 +201,7 @@ func verifyToken(ip, ua, token string, skewSec int64) bool {
 	if tip != ip || tuah != sha1hex(ua) {
 		return false
 	}
+
 	var iat, exp int64
 	if _, err := fmt.Sscanf(tiat, "%d", &iat); err != nil {
 		return false
@@ -202,19 +213,24 @@ func verifyToken(ip, ua, token string, skewSec int64) bool {
 	if now+skewSec < iat || now-skewSec > exp {
 		return false
 	}
+
 	s := sec.Load()
 	if s == nil || len(s.primary) == 0 {
 		return false
 	}
-	want := sign(s.primary, payload)
-	got, err := b64urldec(parts[1])
-	if err != nil {
-		return false
-	}
-	return hmac.Equal(want, got)
+
+	// HMAC over the *raw payload* (same as issuer)
+	wantSig := sign(s.primary, payload)
+
+	return hmac.Equal(wantSig, gotSig)
 }
 
 // ---------------- Negasus handler ----------------
+
+// Input validation / guards
+const maxTokenLen = 8192 // safe upper bound
+
+var b64urlDotRe = regexp.MustCompile(`^[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+$`)
 
 func makeHandler() func(*request.Request) {
 	return func(req *request.Request) {
@@ -252,9 +268,9 @@ func makeHandler() func(*request.Request) {
 		// "verify-token"
 		if mes, err := req.Messages.GetByName("verify-token"); err == nil {
 			tStart := time.Now()
-			var ipStr, ua, cookie string
 			mVerifyTotal.Inc()
 
+			var ipStr, ua, cookie string
 			if v, ok := mes.KV.Get("src-ip"); ok {
 				switch t := v.(type) {
 				case net.IP:
@@ -274,6 +290,21 @@ func makeHandler() func(*request.Request) {
 				}
 			}
 
+			// Guards
+			if cookie == "" || len(cookie) > maxTokenLen || !b64urlDotRe.MatchString(cookie) {
+				req.Actions.SetVar(action.ScopeTransaction, "valid", "0")
+				mVerifyOutcome.WithLabelValues("invalid").Inc()
+				mHandlerSeconds.WithLabelValues("verify-token").Observe(time.Since(tStart).Seconds())
+				return
+			}
+			if *expectedTokenLen > 0 && len(cookie) != *expectedTokenLen {
+				req.Actions.SetVar(action.ScopeTransaction, "valid", "0")
+				mVerifyOutcome.WithLabelValues("invalid").Inc()
+				mHandlerSeconds.WithLabelValues("verify-token").Observe(time.Since(tStart).Seconds())
+				return
+			}
+
+			// Full verification
 			valid := "0"
 			if verifyToken(ipStr, ua, cookie, int64(skew.Seconds())) {
 				valid = "1"
@@ -333,7 +364,6 @@ func main() {
 
 	// Metrics server
 	if *metricsAddr != "" {
-		// register metrics
 		prometheus.MustRegister(mIssueTotal, mVerifyTotal, mVerifyOutcome, mHandlerSeconds, mBuildInfo)
 		mBuildInfo.WithLabelValues(version).Set(1)
 
