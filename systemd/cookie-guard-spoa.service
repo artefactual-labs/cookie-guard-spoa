@@ -1,18 +1,14 @@
-[Install]
-WantedBy=multi-user.target
-
-
 [Unit]
-Description=HAProxy JS Cookie Challenge SPOE (Go, localhost, single-secret)
+Description=HAProxy Cookie Guard SPOE (Go, localhost, single-secret)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 # Listen ONLY on localhost; no TLS, plain TCP.
-ExecStart=/usr/local/bin/js-spoa \
+ExecStart=/usr/local/bin/cookie-guard-spoa \
   -listen 127.0.0.1:9903 \
   -metrics 127.0.0.1:9904 \
-  -secret /etc/js-spoa/secret.key \
+  -secret /etc/cookie-guard/secret.key \
   -ttl 1h
 
 # Run unprivileged
@@ -33,4 +29,3 @@ MemoryDenyWriteExecute=yes
 
 [Install]
 WantedBy=multi-user.target
-

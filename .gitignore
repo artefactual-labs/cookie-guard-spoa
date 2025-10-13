@@ -26,8 +26,9 @@
 # ====================================================================
 
 # Local runtime data or secrets (never commit!)
-/etc/js-spoa/secret.key
-/etc/js-spoa/secret2.key
+/etc/cookie-guard/secret.key
+/etc/cookie-guard/secret2.key
+.gocache/
 /tmp/
 /run/
 /var/
@@ -52,4 +53,3 @@
 /examples/
 /scratch/
 /local/
-

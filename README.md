@@ -1,48 +1,39 @@
-# js-cookie-challenge-spoa
+# cookie-guard-spoa
 
-HAProxy SPOE agent implementing a JavaScript cookie challenge to detect and throttle non-browser traffic (bots, scrapers, etc.) before requests reach your backend.
-
-This service works together with HAProxy to:
-- Issue HMAC-signed cookies for browsers that execute JavaScript.
-- Verify the cookie on subsequent requests.
-- Reject or rate-limit clients that cannot execute JavaScript or set cookies.
-- Integrate with other SPOEs such as `geoip-spoa` or `coraza-spoa`.
+`cookie-guard-spoa` is an HAProxy SPOE (Stream Processing Offload Engine) agent that issues and validates HMAC-signed cookies.  
+HAProxy can serve a lightweight JavaScript challenge (or any other mechanism that sets the cookie) and delegate all signing and verification concerns to this service. Only clients presenting a valid cookie reach your backend.
 
 ---
 
 ## Overview
 
-`js-cookie-challenge-spoa` is a lightweight Go service that communicates with HAProxy over the SPOE (Stream Processing Offload Engine) protocol.
+The agent offloads cookie lifecycle management from HAProxy:
 
-It:
-1. Generates short-lived, signed tokens (HMAC SHA-256) based on the client IP and User-Agent.
-2. Embeds the token in a small JavaScript snippet served by HAProxy.
-3. On reload, the browser sends back the cookie, which HAProxy verifies via the SPOE agent.
-4. Only verified requests reach your backend servers.
+1. Generates short-lived, signed cookies derived from the client IP and User-Agent.
+2. Exposes helper endpoints that HAProxy can embed in a challenge page.
+3. Validates cookies on subsequent requests and reports the outcome back to HAProxy via SPOE frames.
+4. Enables HAProxy to allow, rate-limit, or block requests that fail the validation.
 
-This effectively blocks:
-- Headless bots and scrapers without JavaScript/cookie support.
-- Most generic scanners and curl-based tools.
+This setup filters out most headless bots, generic scanners, or curl-based tooling that cannot execute JavaScript or persist cookies.
 
 ---
 
 ## Features
 
-- Pure Go binary (no runtime or virtualenv)
-- Single secret file for signing tokens
-- SIGHUP reload of secret key
-- Localhost-only TCP (no TLS needed)
-- Built-in health and metrics endpoints
-- Works on HTTP or HTTPS frontends
-- Packaged for Debian/Ubuntu and RHEL/Rocky via [am-packbuild](https://github.com/artefactual-labs/am-packbuild)
+- Stateless HMAC cookie generation and verification.
+- Pure Go binary with no external runtime dependencies.
+- Secret key hot-reload via `SIGHUP`.
+- Local-only TCP listener; TLS is not required for the SPOE link.
+- Built-in health and Prometheus metrics endpoints.
+- Plays well with other SPOEs such as `geoip-spoa` or `coraza-spoa`.
 
 ---
 
 ## Build from source
 
 ```bash
-git clone https://github.com/artefactual-labs/js-cookie-challenge-spoa.git
-cd js-cookie-challenge-spoa
+git clone https://github.com/artefactual-labs/cookie-guard-spoa.git
+cd cookie-guard-spoa
 
 # Ensure Go ≥ 1.21
 go mod tidy
@@ -51,29 +42,29 @@ make
 
 Output:
 ```
-bin/js-spoa
+bin/cookie-guard-spoa
 ```
 
 ---
 
 ## Installation (manual)
 
-1. Create secret
+1. **Create secret**
    ```bash
-   sudo install -d -m0750 /etc/js-spoa
-   sudo head -c 48 /dev/urandom | base64 > /etc/js-spoa/secret.key
-   sudo chmod 0640 /etc/js-spoa/secret.key
+   sudo install -d -m0750 /etc/cookie-guard
+   sudo head -c 48 /dev/urandom | base64 > /etc/cookie-guard/secret.key
+   sudo chmod 0640 /etc/cookie-guard/secret.key
    ```
 
-2. Install binary and service
+2. **Install binary and service**
    ```bash
-   sudo install -m0755 bin/js-spoa /usr/local/bin/js-spoa
-   sudo cp systemd/js-spoa.service /etc/systemd/system/
+   sudo install -m0755 bin/cookie-guard-spoa /usr/local/bin/cookie-guard-spoa
+   sudo cp systemd/cookie-guard-spoa.service /etc/systemd/system/
    sudo systemctl daemon-reload
-   sudo systemctl enable --now js-spoa
+   sudo systemctl enable --now cookie-guard-spoa
    ```
 
-3. Verify
+3. **Verify**
    ```bash
    curl -sf http://127.0.0.1:9904/healthz
    # → ok
@@ -83,15 +74,15 @@ bin/js-spoa
 
 ## HAProxy integration
 
-1. SPOE engine definition (`/etc/haproxy/js-spoe.cfg`)
+1. **SPOE engine definition** (`/etc/haproxy/cookie-guard.cfg`)
 
    ```ini
    [spoe]
    max-frame-size 16384
    max-waiting-frames 2000
 
-   agent js
-       use-backend js_spoa_backend
+   agent cookie_guard
+       use-backend cookie_guard_backend
        messages issue-token verify-token
        option pipelining
        timeout hello      2s
@@ -105,15 +96,15 @@ bin/js-spoa
        args src-ip=ip.src ua=req.hdr(User-Agent),lower cookie=req.cook(hb_v2)
    ```
 
-2. Backend connection
+2. **Backend connection**
 
    ```haproxy
-   backend js_spoa_backend
+   backend cookie_guard_backend
        mode tcp
        server spoa1 127.0.0.1:9903 check
    ```
 
-3. Example app backend
+3. **Example application backend**
 
    ```haproxy
    backend be_app
@@ -124,16 +115,16 @@ bin/js-spoa
        acl chal_exempt_cookie req.cook(hb_v2) -m found
        acl chal_target chal_safe_meth !chal_exempt_path
 
-       http-request set-spoe-group js verify-token if chal_target chal_exempt_cookie
-       acl cookie_ok var(txn.js.valid) -m str 1
+       http-request set-spoe-group cookie_guard verify-token if chal_target chal_exempt_cookie
+       acl cookie_ok var(txn.cookie_guard.valid) -m str 1
 
-       http-request set-spoe-group js issue-token if chal_target !cookie_ok
+       http-request set-spoe-group cookie_guard issue-token if chal_target !cookie_ok
        http-request return lf-file /etc/haproxy/js_challenge_v2.html.lf if chal_target !cookie_ok
 
        server app1 127.0.0.1:8080 check
    ```
 
-4. Frontend
+4. **Frontend**
 
    ```haproxy
    frontend fe_edge
@@ -153,58 +144,55 @@ curl -i http://localhost/ --cookie-jar /tmp/cookies.txt
 curl -i http://localhost/ --cookie /tmp/cookies.txt
 ```
 
-You can temporarily add:
+Add the temporary line below to confirm validation during development:
+
 ```haproxy
-http-response add-header X-JS-Valid %[var(txn.js.valid)]
+http-response add-header X-CookieGuard-Valid %[var(txn.cookie_guard.valid)]
 ```
-to confirm validation.
 
 ---
 
 ## Security notes
 
-- The secret key (`/etc/js-spoa/secret.key`) must be private and stable across restarts.
-- Use SIGHUP to reload a new key:
+- Keep the secret key (`/etc/cookie-guard/secret.key`) private and stable across restarts.
+- Reload the service to pick up a new key:
   ```bash
-  systemctl kill -s HUP js-spoa
+  systemctl kill -s HUP cookie-guard-spoa
   ```
-- Run the service as a non-privileged user (`nobody:nogroup`).
-- Bind to `127.0.0.1` only—no TLS needed for local connections.
+- Run the service as a non-privileged user (for example `nobody:nogroup`).
+- Bind to `127.0.0.1`; the SPOE link does not need TLS.
 
 ---
 
 ## Health and Metrics
 
-The service exposes a small HTTP listener (default: `127.0.0.1:9904`) providing:
+The service exposes `127.0.0.1:9904` by default with:
 
-| Endpoint | Description | Example |
-|-----------|--------------|----------|
-| `/healthz` | Health check — returns “ok” | `curl -sf http://127.0.0.1:9904/healthz` |
-| `/metrics` | Prometheus endpoint with counters and histograms | `curl -sf http://127.0.0.1:9904/metrics` |
+| Endpoint   | Description                                  | Example                                      |
+|------------|----------------------------------------------|----------------------------------------------|
+| `/healthz` | Health check — returns “ok”                  | `curl -sf http://127.0.0.1:9904/healthz`     |
+| `/metrics` | Prometheus metrics with counters/histograms | `curl -sf http://127.0.0.1:9904/metrics`     |
 
-### Example `/metrics` output
+Example snippet:
 
 ```
-# HELP js_spoa_issue_total Total number of issued challenge tokens
-# TYPE js_spoa_issue_total counter
-js_spoa_issue_total 42
-# HELP js_spoa_verify_total Total number of verify requests
-# TYPE js_spoa_verify_total counter
-js_spoa_verify_total 41
-# HELP js_spoa_verify_outcome_total Verify outcomes by result
-# TYPE js_spoa_verify_outcome_total counter
-js_spoa_verify_outcome_total{outcome="valid"} 40
-js_spoa_verify_outcome_total{outcome="invalid"} 1
-# HELP js_spoa_handler_seconds Time spent handling SPOE messages
-# TYPE js_spoa_handler_seconds histogram
-js_spoa_handler_seconds_sum{message="issue-token"} 0.072
-js_spoa_handler_seconds_count{message="issue-token"} 42
-# HELP js_spoa_build_info Build information
-# TYPE js_spoa_build_info gauge
-js_spoa_build_info{version="v1.0.0"} 1
+# HELP cookie_guard_issue_total Total number of issued challenge tokens
+# TYPE cookie_guard_issue_total counter
+cookie_guard_issue_total 42
+# HELP cookie_guard_verify_total Total number of verify requests
+# TYPE cookie_guard_verify_total counter
+cookie_guard_verify_total 41
+# HELP cookie_guard_verify_outcome_total Verify outcomes by result
+# TYPE cookie_guard_verify_outcome_total counter
+cookie_guard_verify_outcome_total{outcome="valid"} 40
+cookie_guard_verify_outcome_total{outcome="invalid"} 1
+# HELP cookie_guard_handler_seconds Time spent handling SPOE messages
+# TYPE cookie_guard_handler_seconds histogram
+cookie_guard_handler_seconds_sum{message="issue-token"} 0.072
+cookie_guard_handler_seconds_count{message="issue-token"} 42
 ```
 
-You can scrape this from Prometheus or inspect it locally for debugging.
+Scrape these metrics from Prometheus or query them directly during debugging.
 
 ---
 
@@ -212,8 +200,8 @@ You can scrape this from Prometheus or inspect it locally for debugging.
 
 ```
 .
-├── cmd/js-spoa/                # main Go entrypoint
-├── systemd/js-spoa.service     # systemd unit
+├── cmd/cookie-guard-spoa/      # main Go entrypoint
+├── systemd/cookie-guard-spoa.service # systemd unit
 ├── haproxy/js-spoe.cfg         # SPOE config snippet
 ├── web/js_challenge_v2.html.lf # HTML served by HAProxy
 ├── packaging/                  # am-packbuild manifests
@@ -225,9 +213,9 @@ You can scrape this from Prometheus or inspect it locally for debugging.
 
 ## Development
 
-- Reload secret without restart:
+- Reload the secret without restart:
   ```bash
-  systemctl kill -s HUP js-spoa
+  systemctl kill -s HUP cookie-guard-spoa
   ```
 - Debug HAProxy integration:
   ```bash
@@ -240,6 +228,5 @@ You can scrape this from Prometheus or inspect it locally for debugging.
 - Check metrics during development:
   ```bash
   curl -sf http://127.0.0.1:9904/healthz
-  curl -sf http://127.0.0.1:9904/metrics | grep js_spoa_
+  curl -sf http://127.0.0.1:9904/metrics | grep cookie_guard_
   ```
-

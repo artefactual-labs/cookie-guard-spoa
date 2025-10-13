@@ -1,4 +1,4 @@
-module github.com/your-org/js-cookie-challenge-spoa
+module github.com/artefactual-labs/cookie-guard-spoa
 
 go 1.21
 

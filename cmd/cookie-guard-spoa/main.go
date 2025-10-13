@@ -1,25 +1,28 @@
-// JS cookie challenge SPOE for HAProxy (Negasus library).
+// Cookie Guard SPOE for HAProxy (Negasus library).
 //
 // Endpoints (metrics listener):
 //   - /healthz  : liveness probe -> "ok"
 //   - /metrics  : Prometheus metrics
 //
 // Metrics exposed:
-//   - js_spoa_issue_total
-//   - js_spoa_verify_total
-//   - js_spoa_verify_outcome_total{outcome="valid"|"invalid"}
-//   - js_spoa_handler_seconds_bucket|sum|count{message="issue-token"|"verify-token"}
-//   - js_spoa_build_info{version="<ldflags-set>"}
+//   - cookie_guard_issue_total
+//   - cookie_guard_verify_total
+//   - cookie_guard_verify_outcome_total{outcome="valid"|"invalid"}
+//   - cookie_guard_handler_seconds_bucket|sum|count{message="issue-token"|"verify-token"}
+//   - cookie_guard_build_info{version="<ldflags-set>"}
 //
 // Build (embed version):
-//   go build -trimpath -ldflags "-s -w -X 'main.version=$(git describe --tags --always || echo dev)'" -o bin/js-spoa ./cmd/js-spoa
+//
+//	go build -trimpath -ldflags "-s -w -X 'main.version=$(git describe --tags --always || echo dev)'" -o bin/cookie-guard-spoa ./cmd/cookie-guard-spoa
 //
 // Run (dev):
-//   ./bin/js-spoa -listen 127.0.0.1:9903 -metrics 127.0.0.1:9904 -secret /etc/js-spoa/secret.key -ttl 1h
+//
+//	./bin/cookie-guard-spoa -listen 127.0.0.1:9903 -metrics 127.0.0.1:9904 -secret /etc/cookie-guard/secret.key -ttl 1h
 //
 // Token details:
-//   token = base64url(payload) + "." + base64url(HMAC_SHA256(secret, payload))
-//   payload = ip|ua_sha1|iat|exp|nonce
+//
+//	token = base64url(payload) + "." + base64url(HMAC_SHA256(secret, payload))
+//	payload = ip|ua_sha1|iat|exp|nonce
 package main
 
 import (
@@ -61,7 +64,7 @@ var version = "dev"
 var (
 	listenAddr       = flag.String("listen", "127.0.0.1:9903", "SPOE listen address")
 	metricsAddr      = flag.String("metrics", "127.0.0.1:9904", "Metrics/health listen address (empty to disable)")
-	secretPath       = flag.String("secret", "/etc/js-spoa/secret.key", "Primary secret file path")
+	secretPath       = flag.String("secret", "/etc/cookie-guard/secret.key", "Primary secret file path")
 	ttl              = flag.Duration("ttl", 1*time.Hour, "Token TTL (e.g., 1h)")
 	skew             = flag.Duration("skew", 30*time.Second, "Clock skew allowance")
 	expectedTokenLen = flag.Int("expected-len", 0, "If >0 enforce exact token length (for stricter validation)")
@@ -75,12 +78,12 @@ var sec atomic.Pointer[secrets]
 // ---------------- Prometheus metrics ----------------
 
 var (
-	mIssueTotal  = prometheus.NewCounter(prometheus.CounterOpts{Name: "js_spoa_issue_total", Help: "Total number of issued challenge tokens"})
-	mVerifyTotal = prometheus.NewCounter(prometheus.CounterOpts{Name: "js_spoa_verify_total", Help: "Total number of verify requests"})
+	mIssueTotal  = prometheus.NewCounter(prometheus.CounterOpts{Name: "cookie_guard_issue_total", Help: "Total number of issued challenge tokens"})
+	mVerifyTotal = prometheus.NewCounter(prometheus.CounterOpts{Name: "cookie_guard_verify_total", Help: "Total number of verify requests"})
 
 	mVerifyOutcome = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Name: "js_spoa_verify_outcome_total",
+			Name: "cookie_guard_verify_outcome_total",
 			Help: "Verify outcomes by result",
 		},
 		[]string{"outcome"},
@@ -88,7 +91,7 @@ var (
 
 	mHandlerSeconds = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "js_spoa_handler_seconds",
+			Name:    "cookie_guard_handler_seconds",
 			Help:    "Time spent handling SPOE messages",
 			Buckets: prometheus.DefBuckets,
 		},
@@ -97,7 +100,7 @@ var (
 
 	mBuildInfo = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "js_spoa_build_info",
+			Name: "cookie_guard_build_info",
 			Help: "Build information",
 		},
 		[]string{"version"},
@@ -357,7 +360,7 @@ func main() {
 	}
 	defer ln.Close()
 
-	log.Printf("js-spoa %s listening on %s (metrics: %s)", version, *listenAddr, *metricsAddr)
+	log.Printf("cookie-guard-spoa %s listening on %s (metrics: %s)", version, *listenAddr, *metricsAddr)
 
 	h := makeHandler()
 	a := agent.New(h, logger.NewDefaultLog())
@@ -387,4 +390,3 @@ func main() {
 
 	<-context.Background().Done()
 }
-
