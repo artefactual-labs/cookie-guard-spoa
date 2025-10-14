@@ -68,6 +68,7 @@ var (
 	ttl              = flag.Duration("ttl", 1*time.Hour, "Token TTL (e.g., 1h)")
 	skew             = flag.Duration("skew", 30*time.Second, "Clock skew allowance")
 	expectedTokenLen = flag.Int("expected-len", 0, "If >0 enforce exact token length (for stricter validation)")
+	debugMode        = flag.Bool("debug", false, "Enable verbose debug logging (for development only)")
 )
 
 // Secret storage (atomic swap on SIGHUP)
@@ -128,6 +129,13 @@ func b64url(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
 
 func b64urldec(s string) ([]byte, error) { return base64.RawURLEncoding.DecodeString(s) }
 
+func debugf(format string, args ...interface{}) {
+	if debugMode == nil || !*debugMode {
+		return
+	}
+	log.Printf("debug: "+format, args...)
+}
+
 func randNonce(n int) (string, error) {
 	buf := make([]byte, n)
 	if _, err := rand.Read(buf); err != nil {
@@ -153,6 +161,7 @@ func nowUnix() int64 { return time.Now().Unix() }
 
 func issueToken(ip, ua string) (token string, maxAgeSec int, err error) {
 	if ip == "" {
+		debugf("issue-token: skipping token issue for empty src-ip (ua len=%d)", len(ua))
 		return "", 0, nil
 	}
 	uah := sha1hex(ua)
@@ -160,72 +169,86 @@ func issueToken(ip, ua string) (token string, maxAgeSec int, err error) {
 	exp := iat + int64(ttl.Seconds())
 	nonce, err := randNonce(12)
 	if err != nil {
+		debugf("issue-token: failed to generate nonce: %v", err)
 		return "", 0, err
 	}
 	payload := fmt.Sprintf("%s|%s|%d|%d|%s", ip, uah, iat, exp, nonce)
 
 	s := sec.Load()
 	if s == nil || len(s.primary) == 0 {
+		debugf("issue-token: secret not loaded (payload ip=%s)", ip)
 		return "", 0, errors.New("no secret loaded")
 	}
 
 	// HMAC over the *raw payload*
 	sig := b64url(sign(s.primary, payload))
 
-	return b64url([]byte(payload)) + "." + sig, int(*ttl / time.Second), nil
+	tok := b64url([]byte(payload)) + "." + sig
+	debugf("issue-token: issued token (len=%d maxAge=%ds ip=%s ua_sha1=%s)", len(tok), int(*ttl/time.Second), ip, uah)
+
+	return tok, int(*ttl / time.Second), nil
 }
 
 func verifyToken(ip, ua, token string, skewSec int64) bool {
+	ok, _ := verifyTokenDetailed(ip, ua, token, skewSec)
+	return ok
+}
+
+func verifyTokenDetailed(ip, ua, token string, skewSec int64) (bool, string) {
 	if ip == "" || token == "" {
-		return false
+		return false, "empty src-ip or token"
 	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 2 {
-		return false
+		return false, "token missing payload/signature separator"
 	}
 
 	// decode payload and signature
 	rawPayload, err := b64urldec(parts[0])
 	if err != nil {
-		return false
+		return false, "payload base64 decode failed"
 	}
 	gotSig, err := b64urldec(parts[1])
 	if err != nil {
-		return false
+		return false, "signature base64 decode failed"
 	}
 
 	// parse payload
 	payload := string(rawPayload) // ip|ua_sha1|iat|exp|nonce
 	ps := strings.Split(payload, "|")
 	if len(ps) != 5 {
-		return false
+		return false, "unexpected payload field count"
 	}
 	tip, tuah, tiat, texp := ps[0], ps[1], ps[2], ps[3]
 	if tip != ip || tuah != sha1hex(ua) {
-		return false
+		return false, "ip or ua hash mismatch"
 	}
 
 	var iat, exp int64
 	if _, err := fmt.Sscanf(tiat, "%d", &iat); err != nil {
-		return false
+		return false, "invalid issued-at"
 	}
 	if _, err := fmt.Sscanf(texp, "%d", &exp); err != nil {
-		return false
+		return false, "invalid expiration"
 	}
 	now := nowUnix()
 	if now+skewSec < iat || now-skewSec > exp {
-		return false
+		return false, "token not within validity window"
 	}
 
 	s := sec.Load()
 	if s == nil || len(s.primary) == 0 {
-		return false
+		return false, "secret not loaded"
 	}
 
 	// HMAC over the *raw payload* (same as issuer)
 	wantSig := sign(s.primary, payload)
 
-	return hmac.Equal(wantSig, gotSig)
+	if !hmac.Equal(wantSig, gotSig) {
+		return false, "signature mismatch"
+	}
+
+	return true, ""
 }
 
 // ---------------- Negasus handler ----------------
@@ -297,23 +320,27 @@ func makeHandler() func(*request.Request) {
 			if cookie == "" || len(cookie) > maxTokenLen || !b64urlDotRe.MatchString(cookie) {
 				req.Actions.SetVar(action.ScopeTransaction, "valid", "0")
 				mVerifyOutcome.WithLabelValues("invalid").Inc()
+				debugf("verify-token: guard rejected cookie (len=%d match=%t)", len(cookie), b64urlDotRe.MatchString(cookie))
 				mHandlerSeconds.WithLabelValues("verify-token").Observe(time.Since(tStart).Seconds())
 				return
 			}
 			if *expectedTokenLen > 0 && len(cookie) != *expectedTokenLen {
 				req.Actions.SetVar(action.ScopeTransaction, "valid", "0")
 				mVerifyOutcome.WithLabelValues("invalid").Inc()
+				debugf("verify-token: guard rejected cookie len=%d expected=%d", len(cookie), *expectedTokenLen)
 				mHandlerSeconds.WithLabelValues("verify-token").Observe(time.Since(tStart).Seconds())
 				return
 			}
 
 			// Full verification
 			valid := "0"
-			if verifyToken(ipStr, ua, cookie, int64(skew.Seconds())) {
+			if ok, reason := verifyTokenDetailed(ipStr, ua, cookie, int64(skew.Seconds())); ok {
 				valid = "1"
 				mVerifyOutcome.WithLabelValues("valid").Inc()
+				debugf("verify-token: accepted (ip=%s cookieLen=%d skew=%ds)", ipStr, len(cookie), int(skew.Seconds()))
 			} else {
 				mVerifyOutcome.WithLabelValues("invalid").Inc()
+				debugf("verify-token: rejected (ip=%s cookieLen=%d reason=%s)", ipStr, len(cookie), reason)
 			}
 			req.Actions.SetVar(action.ScopeTransaction, "valid", valid)
 			mHandlerSeconds.WithLabelValues("verify-token").Observe(time.Since(tStart).Seconds())
@@ -325,6 +352,10 @@ func makeHandler() func(*request.Request) {
 
 func main() {
 	flag.Parse()
+
+	if *debugMode {
+		log.Printf("debug logging enabled")
+	}
 
 	// Load secret
 	b, err := loadSecret(*secretPath)

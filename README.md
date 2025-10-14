@@ -152,6 +152,18 @@ http-response add-header X-CookieGuard-Valid %[var(txn.cookie_guard.valid)]
 
 ---
 
+### Debug logging
+
+Enable verbose traces of issued and verified cookies when developing:
+
+```bash
+./bin/cookie-guard-spoa -listen 127.0.0.1:9903 -metrics 127.0.0.1:9904 -secret /etc/cookie-guard/secret.key -ttl 1h -debug
+```
+
+The agent logs why cookies are accepted or rejected; disable `-debug` in production to avoid noisy logs.
+
+---
+
 ## Security notes
 
 - Keep the secret key (`/etc/cookie-guard/secret.key`) private and stable across restarts.
