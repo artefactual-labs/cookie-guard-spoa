@@ -35,7 +35,7 @@ This setup filters out most headless bots, generic scanners, or curl-based tooli
 git clone https://github.com/artefactual-labs/cookie-guard-spoa.git
 cd cookie-guard-spoa
 
-# Ensure Go ≥ 1.21
+# Ensure Go ≥ 1.25.3
 go mod tidy
 make
 ```

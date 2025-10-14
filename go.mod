@@ -1,6 +1,7 @@
 module github.com/artefactual-labs/cookie-guard-spoa
 
-go 1.21
+go 1.25
+toolchain go1.25.3
 
 require (
 	github.com/negasus/haproxy-spoe-go v1.0.7
