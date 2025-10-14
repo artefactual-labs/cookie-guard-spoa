@@ -1,0 +1,22 @@
+description: Validates a canonical semantic version string (e.g., v1.2.3) with a required leading 'v', using the semver.org specification regex.
+
+inputs:
+  version:
+    description: Canonical semantic version to validate (e.g., v1.2.3 or v1.2.3-rc.1)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Validate semantic version
+      shell: python
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        import os, re, sys
+        version = os.environ.get("VERSION", "").strip()
+        pattern = r'^v(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)(?:-(?P<prerelease>(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+(?P<buildmetadata>[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$'
+        if not version or not re.fullmatch(pattern, version):
+          print(f"Error: '{version}' is not a valid canonical SemVer (must start with 'v', e.g., v1.2.3).", file=sys.stderr)
+          sys.exit(1)
+        print(f"Valid canonical SemVer: {version}")

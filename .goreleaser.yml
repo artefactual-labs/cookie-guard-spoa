@@ -1,0 +1,41 @@
+version: 2
+project_name: cookie-guard-spoa
+
+release:
+  github:
+    owner: artefactual-labs
+    name: cookie-guard-spoa
+
+builds:
+  - id: cookie-guard-spoa
+    main: ./cmd/cookie-guard-spoa
+    binary: cookie-guard-spoa
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s
+      - -w
+      - -X main.version={{.Version}}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  use: git
+  abbrev: 8
