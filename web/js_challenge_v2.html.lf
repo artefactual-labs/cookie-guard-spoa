@@ -22,19 +22,20 @@ Cache-Control: no-store
       <div class="spinner"></div>
       <h1>Just a moment…</h1>
       <p>We’re checking your browser and enabling access. If JavaScript or cookies are disabled, please enable them and reload.</p>
+
       <script>
         (function(){
           try {
-            var token  = "%[var(txn.js.token)]";
-            var maxAge = "%[var(txn.js.max_age)]";
-            // Dev: no "; Secure" so it works over plain HTTP
-            document.cookie = "hb_v2=" + token + "; Max-Age=" + maxAge + "; Path=/; SameSite=Lax";
-            setTimeout(function(){ location.reload(); }, 1200);
-          } catch(e) { /* ignore */ }
+            var token  = "%[var(txn.cookieguard.token)]";
+            var maxAge = "%[var(txn.cookieguard.max_age)]";
+            // Add "; Secure" only if you’re serving the challenge over HTTPS (recommended)
+            document.cookie = "hb_v2=" + token + "; Max-Age=" + maxAge + "; Path=/; SameSite=Lax; Secure";
+            setTimeout(function(){ location.reload(); }, 900);
+          } catch(e) {}
         })();
       </script>
+
       <noscript><p><strong>JavaScript is required.</strong></p></noscript>
     </div>
   </body>
 </html>
-

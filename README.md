@@ -51,15 +51,17 @@ bin/cookie-guard-spoa
 
 1. **Create secret**
    ```bash
-   sudo install -d -m0750 /etc/cookie-guard
-   sudo head -c 48 /dev/urandom | base64 > /etc/cookie-guard/secret.key
-   sudo chmod 0640 /etc/cookie-guard/secret.key
+   sudo install -d -m0750 /etc/cookie-guard-spoa
+   sudo head -c 48 /dev/urandom | base64 > /etc/cookie-guard-spoa/secret.key
+   sudo chmod 0640 /etc/cookie-guard-spoa/secret.key
    ```
 
 2. **Install binary and service**
    ```bash
    sudo install -m0755 bin/cookie-guard-spoa /usr/local/bin/cookie-guard-spoa
    sudo cp systemd/cookie-guard-spoa.service /etc/systemd/system/
+   sudo install -D -m0644 packaging/default/cookie-guard-spoa /etc/default/cookie-guard-spoa
+   sudo install -D -m0644 haproxy/cookie-guard-spoa.cfg /etc/haproxy/cookie-guard-spoa.cfg
    sudo systemctl daemon-reload
    sudo systemctl enable --now cookie-guard-spoa
    ```
@@ -69,6 +71,24 @@ bin/cookie-guard-spoa
    curl -sf http://127.0.0.1:9904/healthz
    # → ok
    ```
+
+---
+
+## Packages
+
+Official `.deb` and `.rpm` packages are published alongside each GitHub release. Installing one of these packages will:
+
+- Place the binary in `/usr/local/bin/cookie-guard-spoa`.
+- Install the systemd unit at `/etc/systemd/system/cookie-guard-spoa.service`.
+- Create `/etc/cookie-guard-spoa/` (group-owned by `haproxy` when present) and seed a random `secret.key` if none exists.
+- Enable and start the service automatically (requires systemd).
+- Drop default CLI options in `/etc/default/cookie-guard-spoa` (edit to customize runtime flags; `-debug` is not enabled by default).
+- Place an HAProxy SPOE snippet at `/etc/haproxy/cookie-guard-spoa.cfg`.
+- When SELinux is enforcing, allow TCP ports `9903` and `9904` for the service.
+
+After installation, adjust `/etc/cookie-guard-spoa/secret.key` or edit the systemd unit as needed, then `systemctl restart cookie-guard-spoa`.
+
+To change command-line flags, edit `/etc/default/cookie-guard-spoa`; the service reads `COOKIE_GUARD_SPOA_OPTS` from that file. Add `-debug` temporarily when troubleshooting and remove it afterwards to keep logs quiet.
 
 ---
 
@@ -157,7 +177,7 @@ http-response add-header X-CookieGuard-Valid %[var(txn.cookie_guard.valid)]
 Enable verbose traces of issued and verified cookies when developing:
 
 ```bash
-./bin/cookie-guard-spoa -listen 127.0.0.1:9903 -metrics 127.0.0.1:9904 -secret /etc/cookie-guard/secret.key -ttl 1h -debug
+./bin/cookie-guard-spoa -listen 127.0.0.1:9903 -metrics 127.0.0.1:9904 -secret /etc/cookie-guard-spoa/secret.key -ttl 1h -debug
 ```
 
 The agent logs why cookies are accepted or rejected; disable `-debug` in production to avoid noisy logs.
@@ -166,7 +186,7 @@ The agent logs why cookies are accepted or rejected; disable `-debug` in product
 
 ## Security notes
 
-- Keep the secret key (`/etc/cookie-guard/secret.key`) private and stable across restarts.
+- Keep the secret key (`/etc/cookie-guard-spoa/secret.key`) private and stable across restarts.
 - Reload the service to pick up a new key:
   ```bash
   systemctl kill -s HUP cookie-guard-spoa

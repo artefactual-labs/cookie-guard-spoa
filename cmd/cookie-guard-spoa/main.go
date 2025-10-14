@@ -64,7 +64,7 @@ var version = "dev"
 var (
 	listenAddr       = flag.String("listen", "127.0.0.1:9903", "SPOE listen address")
 	metricsAddr      = flag.String("metrics", "127.0.0.1:9904", "Metrics/health listen address (empty to disable)")
-	secretPath       = flag.String("secret", "/etc/cookie-guard/secret.key", "Primary secret file path")
+	secretPath       = flag.String("secret", "/etc/cookie-guard-spoa/secret.key", "Primary secret file path")
 	ttl              = flag.Duration("ttl", 1*time.Hour, "Token TTL (e.g., 1h)")
 	skew             = flag.Duration("skew", 30*time.Second, "Clock skew allowance")
 	expectedTokenLen = flag.Int("expected-len", 0, "If >0 enforce exact token length (for stricter validation)")

@@ -39,3 +39,31 @@ checksum:
 changelog:
   use: git
   abbrev: 8
+
+nfpms:
+  - id: default
+    package_name: cookie-guard-spoa
+    formats: [deb, rpm]
+    vendor: Artefactual Systems Inc.
+    homepage: https://github.com/artefactual-labs/cookie-guard-spoa
+    maintainer: Artefactual Systems Inc. <info@artefactual.com>
+    description: HAProxy SPOE agent that issues and verifies Cookie Guard tokens.
+    license: Apache-2.0
+    bindir: /usr/local/bin
+    file_name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Arch }}'
+    contents:
+      - src: systemd/cookie-guard-spoa.service
+        dst: /etc/systemd/system/cookie-guard-spoa.service
+        type: config
+      - src: packaging/default/cookie-guard-spoa
+        dst: /etc/default/cookie-guard-spoa
+        type: config
+      - src: haproxy/cookie-guard-spoa.cfg
+        dst: /etc/haproxy/cookie-guard-spoa.cfg
+        type: config
+    dependencies:
+      - haproxy
+    scripts:
+      postinstall: packaging/nfpm/postinstall.sh
+      preremove: packaging/nfpm/preremove.sh
+      postremove: packaging/nfpm/postremove.sh

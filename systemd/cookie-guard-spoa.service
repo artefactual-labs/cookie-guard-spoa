@@ -1,24 +1,25 @@
 [Unit]
-Description=HAProxy Cookie Guard SPOE (Go, localhost, single-secret)
+Description=Cookie Guard SPOA (haproxy service)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
+# Load CLI options from /etc/default/cookie-guard-spoa if present.
+EnvironmentFile=-/etc/default/cookie-guard-spoa
+Environment="COOKIE_GUARD_SPOA_OPTS=-listen 127.0.0.1:9903 -metrics 127.0.0.1:9904 -secret /etc/cookie-guard-spoa/secret.key -ttl 1h -expected-len 168"
 # Listen ONLY on localhost; no TLS, plain TCP.
-ExecStart=/usr/local/bin/cookie-guard-spoa \
-  -listen 127.0.0.1:9903 \
-  -metrics 127.0.0.1:9904 \
-  -secret /etc/cookie-guard/secret.key \
-  -ttl 1h
+ExecStart=/usr/local/bin/cookie-guard-spoa $COOKIE_GUARD_SPOA_OPTS
 
 # Run unprivileged
-User=nobody
-Group=nogroup
+User=haproxy
+Group=haproxy
 
 Restart=on-failure
 RestartSec=2
+WorkingDirectory=/etc/cookie-guard-spoa
+Environment=GOTRACEBACK=crash
 
-# Hardening (safe with localhost-only)
+# Security hardening (safe with localhost-only)
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
@@ -26,6 +27,10 @@ ProtectHome=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
 
 [Install]
 WantedBy=multi-user.target
