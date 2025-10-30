@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 # Load CLI options from /etc/default/cookie-guard-spoa if present.
 EnvironmentFile=-/etc/default/cookie-guard-spoa
-Environment="COOKIE_GUARD_SPOA_OPTS=-listen 127.0.0.1:9903 -metrics 127.0.0.1:9904 -secret /etc/cookie-guard-spoa/secret.key -ttl 1h -expected-len 168"
+Environment="COOKIE_GUARD_SPOA_OPTS=-listen 127.0.0.1:9903 -metrics 127.0.0.1:9904 -secret /etc/cookie-guard-spoa/secret.key -ttl 1h"
 # Listen ONLY on localhost; no TLS, plain TCP.
 ExecStart=/usr/local/bin/cookie-guard-spoa $COOKIE_GUARD_SPOA_OPTS
 

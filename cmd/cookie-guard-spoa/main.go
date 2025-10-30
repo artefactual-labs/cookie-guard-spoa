@@ -43,6 +43,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -62,13 +63,12 @@ var version = "dev"
 
 // CLI flags
 var (
-	listenAddr       = flag.String("listen", "127.0.0.1:9903", "SPOE listen address")
-	metricsAddr      = flag.String("metrics", "127.0.0.1:9904", "Metrics/health listen address (empty to disable)")
-	secretPath       = flag.String("secret", "/etc/cookie-guard-spoa/secret.key", "Primary secret file path")
-	ttl              = flag.Duration("ttl", 1*time.Hour, "Token TTL (e.g., 1h)")
-	skew             = flag.Duration("skew", 30*time.Second, "Clock skew allowance")
-	expectedTokenLen = flag.Int("expected-len", 0, "If >0 enforce exact token length (for stricter validation)")
-	debugMode        = flag.Bool("debug", false, "Enable verbose debug logging (for development only)")
+	listenAddr  = flag.String("listen", "127.0.0.1:9903", "SPOE listen address")
+	metricsAddr = flag.String("metrics", "127.0.0.1:9904", "Metrics/health listen address (empty to disable)")
+	secretPath  = flag.String("secret", "/etc/cookie-guard-spoa/secret.key", "Primary secret file path")
+	ttl         = flag.Duration("ttl", 1*time.Hour, "Token TTL (e.g., 1h)")
+	skew        = flag.Duration("skew", 30*time.Second, "Clock skew allowance")
+	debugMode   = flag.Bool("debug", false, "Enable verbose debug logging (for development only)")
 )
 
 // Secret storage (atomic swap on SIGHUP)
@@ -155,7 +155,7 @@ func sign(secret []byte, payload string) []byte {
 	return h.Sum(nil)
 }
 
-func nowUnix() int64 { return time.Now().Unix() }
+var nowUnix = func() int64 { return time.Now().Unix() }
 
 // ---------------- token issue / verify ----------------
 
@@ -167,7 +167,7 @@ func issueToken(ip, ua string) (token string, maxAgeSec int, err error) {
 	uah := sha1hex(ua)
 	iat := nowUnix()
 	exp := iat + int64(ttl.Seconds())
-	nonce, err := randNonce(12)
+	nonce, err := randNonce(nonceByteLen)
 	if err != nil {
 		debugf("issue-token: failed to generate nonce: %v", err)
 		return "", 0, err
@@ -258,6 +258,69 @@ const maxTokenLen = 8192 // safe upper bound
 
 var b64urlDotRe = regexp.MustCompile(`^[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+$`)
 
+const (
+	nonceByteLen    = 12
+	uaHashHexLen    = 40
+	nonceStrLen     = (nonceByteLen*8 + 5) / 6
+	signatureB64Len = (sha256.Size*8 + 5) / 6
+)
+
+func b64RawLen(n int) int {
+	return (n*8 + 5) / 6
+}
+
+func digitsCount(n int64) int {
+	if n < 0 {
+		n = -n
+	}
+	return len(strconv.FormatInt(n, 10))
+}
+
+func tokenLooksPlausible(ip, token string) bool {
+	dot := strings.IndexByte(token, '.')
+	if dot <= 0 || dot >= len(token)-1 {
+		return false
+	}
+	if len(token)-dot-1 != signatureB64Len {
+		return false
+	}
+
+	payloadLen := dot
+
+	now := nowUnix()
+	skewSec := int64(skew.Seconds())
+	if skewSec < 0 {
+		skewSec = -skewSec
+	}
+	minIat := now - skewSec
+	if minIat < 0 {
+		minIat = 0
+	}
+	maxIat := now + skewSec
+
+	ttlSec := int64(ttl.Seconds())
+	if ttlSec < 0 {
+		ttlSec = -ttlSec
+	}
+	minExp := minIat + ttlSec
+	maxExp := maxIat + ttlSec
+
+	minIatDigits := digitsCount(minIat)
+	maxIatDigits := digitsCount(maxIat)
+	minExpDigits := digitsCount(minExp)
+	maxExpDigits := digitsCount(maxExp)
+
+	for iDigits := minIatDigits; iDigits <= maxIatDigits; iDigits++ {
+		for eDigits := minExpDigits; eDigits <= maxExpDigits; eDigits++ {
+			payloadBytes := len(ip) + 1 + uaHashHexLen + 1 + iDigits + 1 + eDigits + 1 + nonceStrLen
+			if payloadLen == b64RawLen(payloadBytes) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func makeHandler() func(*request.Request) {
 	return func(req *request.Request) {
 		// "issue-token"
@@ -324,10 +387,10 @@ func makeHandler() func(*request.Request) {
 				mHandlerSeconds.WithLabelValues("verify-token").Observe(time.Since(tStart).Seconds())
 				return
 			}
-			if *expectedTokenLen > 0 && len(cookie) != *expectedTokenLen {
+			if !tokenLooksPlausible(ipStr, cookie) {
 				req.Actions.SetVar(action.ScopeTransaction, "valid", "0")
 				mVerifyOutcome.WithLabelValues("invalid").Inc()
-				debugf("verify-token: guard rejected cookie len=%d expected=%d", len(cookie), *expectedTokenLen)
+				debugf("verify-token: guard rejected cookie due to implausible layout (ipLen=%d len=%d)", len(ipStr), len(cookie))
 				mHandlerSeconds.WithLabelValues("verify-token").Observe(time.Since(tStart).Seconds())
 				return
 			}

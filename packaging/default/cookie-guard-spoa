@@ -6,5 +6,4 @@ COOKIE_GUARD_SPOA_OPTS="\
   -listen 127.0.0.1:9903 \
   -metrics 127.0.0.1:9904 \
   -secret /etc/cookie-guard-spoa/secret.key \
-  -ttl 1h \
-  -expected-len 168"
+  -ttl 1h"
