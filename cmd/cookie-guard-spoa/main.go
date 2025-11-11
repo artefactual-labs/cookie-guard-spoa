@@ -189,66 +189,72 @@ func issueToken(ip, ua string) (token string, maxAgeSec int, err error) {
 	return tok, int(*ttl / time.Second), nil
 }
 
+
 func verifyToken(ip, ua, token string, skewSec int64) bool {
-	ok, _ := verifyTokenDetailed(ip, ua, token, skewSec)
+	ok, _, _ := verifyTokenDetailed(ip, ua, token, skewSec)
 	return ok
 }
 
-func verifyTokenDetailed(ip, ua, token string, skewSec int64) (bool, string) {
+func verifyTokenDetailed(ip, ua, token string, skewSec int64) (bool, string, int64) {
 	if ip == "" || token == "" {
-		return false, "empty src-ip or token"
+		return false, "empty src-ip or token", 0
 	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 2 {
-		return false, "token missing payload/signature separator"
+		return false, "token missing payload/signature separator", 0
 	}
 
 	// decode payload and signature
 	rawPayload, err := b64urldec(parts[0])
 	if err != nil {
-		return false, "payload base64 decode failed"
+		return false, "payload base64 decode failed", 0
 	}
 	gotSig, err := b64urldec(parts[1])
 	if err != nil {
-		return false, "signature base64 decode failed"
+		return false, "signature base64 decode failed", 0
 	}
 
 	// parse payload
 	payload := string(rawPayload) // ip|ua_sha1|iat|exp|nonce
 	ps := strings.Split(payload, "|")
 	if len(ps) != 5 {
-		return false, "unexpected payload field count"
+		return false, "unexpected payload field count", 0
 	}
 	tip, tuah, tiat, texp := ps[0], ps[1], ps[2], ps[3]
 	if tip != ip || tuah != sha1hex(ua) {
-		return false, "ip or ua hash mismatch"
+		return false, "ip or ua hash mismatch", 0
 	}
 
 	var iat, exp int64
 	if _, err := fmt.Sscanf(tiat, "%d", &iat); err != nil {
-		return false, "invalid issued-at"
+		return false, "invalid issued-at", 0
 	}
 	if _, err := fmt.Sscanf(texp, "%d", &exp); err != nil {
-		return false, "invalid expiration"
+		return false, "invalid expiration", 0
 	}
 	now := nowUnix()
 	if now+skewSec < iat || now-skewSec > exp {
-		return false, "token not within validity window"
+		return false, "token not within validity window", 0
 	}
 
 	s := sec.Load()
 	if s == nil || len(s.primary) == 0 {
-		return false, "secret not loaded"
+		return false, "secret not loaded", 0
 	}
 
 	// HMAC over the *raw payload* (same as issuer)
 	wantSig := sign(s.primary, payload)
 
 	if !hmac.Equal(wantSig, gotSig) {
-		return false, "signature mismatch"
+		return false, "signature mismatch", 0
 	}
 
-	return true, ""
+	age := now - iat
+	if age < 0 {
+		age = 0
+	}
+
+	return true, "", age
 }
 
 // ---------------- Negasus handler ----------------
@@ -379,9 +385,12 @@ func makeHandler() func(*request.Request) {
 				}
 			}
 
+			ageSeconds := "0"
+
 			// Guards
 			if cookie == "" || len(cookie) > maxTokenLen || !b64urlDotRe.MatchString(cookie) {
 				req.Actions.SetVar(action.ScopeTransaction, "valid", "0")
+				req.Actions.SetVar(action.ScopeTransaction, "age_seconds", ageSeconds)
 				mVerifyOutcome.WithLabelValues("invalid").Inc()
 				debugf("verify-token: guard rejected cookie (len=%d match=%t)", len(cookie), b64urlDotRe.MatchString(cookie))
 				mHandlerSeconds.WithLabelValues("verify-token").Observe(time.Since(tStart).Seconds())
@@ -389,6 +398,7 @@ func makeHandler() func(*request.Request) {
 			}
 			if !tokenLooksPlausible(ipStr, cookie) {
 				req.Actions.SetVar(action.ScopeTransaction, "valid", "0")
+				req.Actions.SetVar(action.ScopeTransaction, "age_seconds", ageSeconds)
 				mVerifyOutcome.WithLabelValues("invalid").Inc()
 				debugf("verify-token: guard rejected cookie due to implausible layout (ipLen=%d len=%d)", len(ipStr), len(cookie))
 				mHandlerSeconds.WithLabelValues("verify-token").Observe(time.Since(tStart).Seconds())
@@ -397,8 +407,9 @@ func makeHandler() func(*request.Request) {
 
 			// Full verification
 			valid := "0"
-			if ok, reason := verifyTokenDetailed(ipStr, ua, cookie, int64(skew.Seconds())); ok {
+			if ok, reason, age := verifyTokenDetailed(ipStr, ua, cookie, int64(skew.Seconds())); ok {
 				valid = "1"
+				ageSeconds = fmt.Sprintf("%d", age)
 				mVerifyOutcome.WithLabelValues("valid").Inc()
 				debugf("verify-token: accepted (ip=%s cookieLen=%d skew=%ds)", ipStr, len(cookie), int(skew.Seconds()))
 			} else {
@@ -406,6 +417,7 @@ func makeHandler() func(*request.Request) {
 				debugf("verify-token: rejected (ip=%s cookieLen=%d reason=%s)", ipStr, len(cookie), reason)
 			}
 			req.Actions.SetVar(action.ScopeTransaction, "valid", valid)
+			req.Actions.SetVar(action.ScopeTransaction, "age_seconds", ageSeconds)
 			mHandlerSeconds.WithLabelValues("verify-token").Observe(time.Since(tStart).Seconds())
 		}
 	}
