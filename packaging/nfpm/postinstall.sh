@@ -34,4 +34,13 @@ if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   systemctl enable --now "$SERVICE" >/dev/null 2>&1 || true
 fi
 
+# Ensure ALTCHA assets symlink points to packaged version, if present
+ALTCHA_DIR="/etc/haproxy/assets/altcha"
+if [ -f "$ALTCHA_DIR/VERSION" ]; then
+  ALTCHA_VER=$(head -n1 "$ALTCHA_DIR/VERSION" 2>/dev/null || true)
+  if [ -n "$ALTCHA_VER" ] && [ -d "$ALTCHA_DIR/$ALTCHA_VER" ]; then
+    ln -sfn "$ALTCHA_VER" "$ALTCHA_DIR/active"
+  fi
+fi
+
 exit 0

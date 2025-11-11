@@ -53,3 +53,6 @@
 /examples/
 /scratch/
 /local/
+.toolchain/
+.gopath/
+.gocache/

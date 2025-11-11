@@ -5,6 +5,7 @@ go 1.25
 toolchain go1.25.3
 
 require (
+	github.com/altcha-org/altcha-lib-go v0.2.2
 	github.com/negasus/haproxy-spoe-go v1.0.7
 	github.com/prometheus/client_golang v1.18.0
 )

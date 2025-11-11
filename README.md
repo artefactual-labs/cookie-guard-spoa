@@ -1,9 +1,18 @@
 # cookie-guard-spoa
 
-`cookie-guard-spoa` is an HAProxy SPOE (Stream Processing Offload Engine) agent that issues and validates HMAC-signed cookies.  
-HAProxy can serve a lightweight JavaScript challenge (or any other mechanism that sets the cookie) and delegate all signing and verification concerns to this service. Only clients presenting a valid cookie reach your backend.
+`cookie-guard-spoa` is an HAProxy SPOE (Stream Processing Offload Engine) agent that issues and validates HMAC‑signed cookies.
+
+It ships with a privacy‑friendly browser challenge powered by ALTCHA and dedicated endpoints built into the agent. HAProxy serves a small HTML page and the agent verifies the puzzle solution, issuing the `hb_v2` cookie on success. Only clients presenting a valid cookie reach your backend.
+
+Learn more about ALTCHA:
+
+- Website: https://altcha.org
+- JavaScript library (open source): https://github.com/altcha-org/altcha
+- Go library used here: https://github.com/altcha-org/altcha-lib-go
+- Example starter (Go): https://github.com/altcha-org/altcha-starter-go
 
 ---
+
 
 ## Overview
 
@@ -21,6 +30,8 @@ This setup filters out most headless bots, generic scanners, or curl-based tooli
 ## Features
 
 - Stateless HMAC cookie generation and verification.
+- Built‑in ALTCHA support with first‑party endpoints (`/altcha-challenge`, `/altcha-verify`).
+- Privacy‑friendly alternative to CAPTCHAs; no trackers or external calls required.
 - Pure Go binary with no external runtime dependencies.
 - Secret key hot-reload via `SIGHUP`.
 - Local-only TCP listener; TLS is not required for the SPOE link.
@@ -86,9 +97,27 @@ Official `.deb` and `.rpm` packages are published alongside each GitHub release.
 - Place an HAProxy SPOE snippet at `/etc/haproxy/cookie-guard-spoa.cfg`.
 - When SELinux is enforcing, allow TCP ports `9903` and `9904` for the service.
 
+Additionally, packages include the challenge pages and ALTCHA assets under `/etc/haproxy/`:
+
+- `/etc/haproxy/altcha_challenge.html.lf`.
+- ALTCHA JS is installed under `/etc/haproxy/assets/altcha/<version>/altcha.min.js[.lf]` with `/etc/haproxy/assets/altcha/active` symlink updated to the packaged version.
+
 After installation, adjust `/etc/cookie-guard-spoa/secret.key` or edit the systemd unit as needed, then `systemctl restart cookie-guard-spoa`.
 
-To change command-line flags, edit `/etc/default/cookie-guard-spoa`; the service reads `COOKIE_GUARD_SPOA_OPTS` from that file. Add `-debug` temporarily when troubleshooting and remove it afterwards to keep logs quiet.
+To change command-line flags, edit `/etc/default/cookie-guard-spoa`. This file uses a base `COOKIE_GUARD_SPOA_OPTS` plus simple toggles you can uncomment:
+
+```bash
+# /etc/default/cookie-guard-spoa (snippets)
+COOKIE_GUARD_SPOA_OPTS="-listen 127.0.0.1:9903 -metrics 127.0.0.1:9904 -secret /etc/cookie-guard-spoa/secret.key -ttl 1h -skew 30s -altcha-assets /etc/haproxy/assets/altcha -altcha-page /etc/haproxy/altcha_challenge.html.lf -altcha-expires 2m"
+# Enabled by default in packages:
+COOKIE_GUARD_FLAG_COOKIE_SECURE="-cookie-secure"
+# Optional toggles:
+#COOKIE_GUARD_FLAG_DEBUG="-debug"
+#COOKIE_GUARD_FLAG_ALTCHA_DISABLE="-altcha=false"
+#COOKIE_GUARD_FLAG_EXTRA=""
+```
+
+After editing, run `systemctl restart cookie-guard-spoa`.
 
 ---
 
@@ -110,10 +139,10 @@ To change command-line flags, edit `/etc/default/cookie-guard-spoa`; the service
        timeout processing 2s
 
    message issue-token
-       args src-ip=ip.src ua=req.hdr(User-Agent),lower
+       args src-ip=ip.src ua="req.fhdr(User-Agent)"
 
    message verify-token
-       args src-ip=ip.src ua=req.hdr(User-Agent),lower cookie=req.cook(hb_v2)
+       args src-ip=ip.src ua="req.fhdr(User-Agent)" cookie=req.cook(hb_v2)
    ```
 
 2. **Backend connection**
@@ -139,12 +168,56 @@ To change command-line flags, edit `/etc/default/cookie-guard-spoa`; the service
        acl cookie_ok var(txn.cookie_guard.valid) -m str 1
 
        http-request set-spoe-group cookie_guard issue-token if chal_target !cookie_ok
-       http-request return lf-file /etc/haproxy/js_challenge_v2.html.lf if chal_target !cookie_ok
 
        server app1 127.0.0.1:8080 check
    ```
 
-4. **Frontend**
+4. **ALTCHA challenge (default)**
+
+   ALTCHA is the recommended challenge. The agent exposes two endpoints on the metrics HTTP port when `-altcha` is enabled (default: on):
+
+   - `GET /altcha-challenge` — issues a short‑lived puzzle
+   - `POST /altcha-verify` — verifies the client’s solution and, on success, sets the `hb_v2` cookie
+
+   HAProxy routing example (frontend):
+
+   ```haproxy
+   # Route ALTCHA page, verify, and JS to the agent’s HTTP listener
+   acl altcha_routes path_beg -i /altcha /altcha- /assets/altcha/
+   use_backend cookie_guard_http_backend if altcha_routes
+   ```
+
+   Backend used above (already provided in `haproxy/cookie-guard-spoa.cfg`):
+
+   ```haproxy
+   backend cookie_guard_http_backend
+       mode http
+       option forwarded
+       option forwardfor
+       # Ensure agent sees the same client IP HAProxy will use later
+       http-request set-header X-Forwarded-For %[src]
+       server spoa_http 127.0.0.1:9904 check
+   ```
+
+   Notes:
+   - Place `web/altcha_challenge.html.lf` at `/etc/haproxy/altcha_challenge.html.lf`.
+   - Vendor and install versioned ALTCHA assets under `/etc/haproxy/assets/altcha/<version>/altcha.min.js` and keep a stable symlink `/etc/haproxy/assets/altcha/active -> <version>`.
+   - This repo includes helpers to fetch and stage assets locally:
+     ```bash
+     # Set desired ALTCHA JS tag (from altcha releases) and sync
+     echo v2.5.0 > web/assets/altcha/VERSION
+     make altcha-assets
+
+     # Install to HAProxy's path
+     sudo make install-altcha-assets
+     ```
+   - The HTML references `/assets/altcha/active/altcha.min.js`. The agent serves this path from `-altcha-assets` (default `/etc/haproxy/assets/altcha`) to avoid HAProxy buffer limits.
+   - The agent also serves the page at `/altcha` from `-altcha-page` (default `/etc/haproxy/altcha_challenge.html.lf`).
+   - Packages enable `-cookie-secure` by default so `hb_v2` ships with the `Secure` attribute. Comment it in `/etc/default/cookie-guard-spoa` if you must disable it.
+
+ 
+
+6. **Frontend**
 
    ```haproxy
    frontend fe_edge
@@ -181,6 +254,48 @@ Enable verbose traces of issued and verified cookies when developing:
 ```
 
 The agent logs why cookies are accepted or rejected; disable `-debug` in production to avoid noisy logs.
+
+### Update ALTCHA
+
+To update the ALTCHA JavaScript asset and Go library in a controlled way:
+
+- JS asset (served by HAProxy):
+  ```bash
+  echo vX.Y.Z > web/assets/altcha/VERSION    # pick a release tag from altcha
+  make altcha-assets                         # fetches to web/assets/altcha/<version>/ and updates 'active'
+  sudo make install-altcha-assets            # installs under /etc/haproxy/assets/altcha/
+  systemctl reload haproxy                   # start serving the new asset
+  ```
+- Go library (used by the agent):
+  ```bash
+  make altcha-go-bump VERSION=vA.B.C
+  go mod tidy
+  make
+  sudo systemctl restart cookie-guard-spoa
+  ```
+
+ALTCHA-specific flags:
+
+- `-altcha` (default: true) enable/disable the ALTCHA challenge and verify endpoints.
+- `-altcha-expires` (default: 2m) lifetime of issued challenges.
+- `-cookie-secure` add the `Secure` attribute to `hb_v2` set by `/altcha-verify`.
+- `-altcha-assets` base directory for vendored JS; serves `/assets/altcha/active/altcha.min.js`.
+- `-altcha-page` path to the HTML page served at `/altcha`.
+
+Versioning policy and updates:
+
+- Go library: pinned in `go.mod` as `github.com/altcha-org/altcha-lib-go @ vX.Y.Z`. Bump with:
+  ```bash
+  go get github.com/altcha-org/altcha-lib-go@vX.Y.Z
+  go mod tidy
+  ```
+- JS asset: pinned by directory name under `web/assets/altcha/<version>` and by the `VERSION` file. Bump with:
+  ```bash
+  echo vX.Y.Z > web/assets/altcha/VERSION
+  make altcha-assets
+  sudo make install-altcha-assets
+  systemctl reload haproxy
+  ```
 
 ---
 
@@ -235,7 +350,6 @@ Scrape these metrics from Prometheus or query them directly during debugging.
 ├── cmd/cookie-guard-spoa/      # main Go entrypoint
 ├── systemd/cookie-guard-spoa.service # systemd unit
 ├── haproxy/js-spoe.cfg         # SPOE config snippet
-├── web/js_challenge_v2.html.lf # HTML served by HAProxy
 ├── packaging/                  # am-packbuild manifests
 ├── bin/                        # compiled binaries (ignored in git)
 └── dist/                       # built packages (ignored in git)
@@ -262,3 +376,4 @@ Scrape these metrics from Prometheus or query them directly during debugging.
   curl -sf http://127.0.0.1:9904/healthz
   curl -sf http://127.0.0.1:9904/metrics | grep cookie_guard_
   ```
+ 

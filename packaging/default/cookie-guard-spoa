@@ -1,9 +1,24 @@
-# Runtime options for cookie-guard-spoa; override values as needed and
-# restart the service. Example:
-#   COOKIE_GUARD_SPOA_OPTS="-listen 0.0.0.0:9903 ..."
+# Runtime options for cookie-guard-spoa. Edit values and
+# restart the service to apply changes.
 
+# Base options (defaults are safe for production)
 COOKIE_GUARD_SPOA_OPTS="\
   -listen 127.0.0.1:9903 \
   -metrics 127.0.0.1:9904 \
   -secret /etc/cookie-guard-spoa/secret.key \
-  -ttl 1h"
+  -ttl 1h \
+  -skew 30s \
+  -altcha-assets /etc/haproxy/assets/altcha \
+  -altcha-page /etc/haproxy/altcha_challenge.html.lf \
+  -altcha-expires 2m"
+
+# Optional toggles. Uncomment to enable.
+#COOKIE_GUARD_FLAG_DEBUG="-debug"
+# set Secure on hb_v2 (default enabled)
+COOKIE_GUARD_FLAG_COOKIE_SECURE="-cookie-secure"
+# Ignore User-Agent binding (use only IP+iat+exp+nonce)
+#COOKIE_GUARD_FLAG_NO_UA_BIND="-ua-bind=false"
+#COOKIE_GUARD_FLAG_ALTCHA_DISABLE="-altcha=false"   # disable ALTCHA endpoints
+
+# Extra flags (advanced). Example: -listen 0.0.0.0:9903
+#COOKIE_GUARD_FLAG_EXTRA=""
