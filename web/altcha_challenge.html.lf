@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Verifying…</title>
+  <script type="module" src="/assets/altcha/active/altcha.min.js"></script>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0b1220;
+      --card: #121a2b;
+      --text: #e6e6e6;
+      --muted: #b6c2d9;
+      --accent: #6ea8fe;
+      --shadow: 0 8px 32px rgba(0,0,0,.30);
+      --radius: 16px;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f6f7fb;
+        --card: #ffffff;
+        --text: #0f172a;
+        --muted: #4b5563;
+        --accent: #2563eb;
+        --shadow: 0 14px 40px rgba(15, 23, 42, 0.15);
+      }
+    }
+    @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+    html, body { height: 100%; margin: 0; }
+    body { display: grid; place-items: center; background: var(--bg); font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; color: var(--text); }
+    .card { width: min(520px, calc(100% - 2rem)); background: var(--card); border-radius: var(--radius); box-shadow: var(--shadow); padding: 28px 24px; line-height: 1.5; }
+    h1 { margin: 0 0 .25rem 0; font-size: 1.15rem; letter-spacing: .2px; }
+    p { margin: .25rem 0 1rem 0; color: var(--muted); font-size: .95rem; }
+    .row { display: flex; align-items: center; gap: .75rem; }
+    .spinner { inline-size: 28px; block-size: 28px; border: 3px solid color-mix(in oklab, var(--muted) 35%, transparent); border-top-color: var(--accent); border-radius: 50%; animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .hint { margin-top: .75rem; font-size: .85rem; color: var(--muted); }
+    .brand { margin-top: .75rem; font-size: .8rem; color: var(--muted); opacity: .9; }
+    .brand a { color: var(--accent); text-decoration: none; }
+    .brand a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="card" role="status" aria-live="polite">
+    <div class="row">
+      <div class="spinner" aria-hidden="true"></div>
+      <div>
+        <h1>Just a moment…</h1>
+        <p>We’re verifying your browser and enabling access.</p>
+      </div>
+    </div>
+
+    <altcha-widget
+      id="altchaWidget"
+      challengeurl="/altcha-challenge"
+      verifyurl="/altcha-verify"
+      sitekey="default"
+      theme="light">
+    </altcha-widget>
+
+    <div class="hint">If it takes longer than a second, please keep this tab open.</div>
+    <div class="brand">Powered by <a href="https://altcha.org" rel="noopener noreferrer" target="_blank">ALTCHA</a></div>
+  </div>
+
+  <script>
+    // Clear any stale hb_v2 cookies across common domain variants to avoid loops
+    // when topology changes (e.g., extra proxy) cause old tokens to fail.
+    function clearHb2Everywhere() {
+      const secure = (location.protocol === 'https:') ? '; Secure' : '';
+      const base = '; Max-Age=0; Path=/; SameSite=Lax' + secure;
+      // Host-only cookie
+      document.cookie = 'hb_v2=' + base;
+      // Domain cookies for parent domains (best-effort)
+      const parts = location.hostname.split('.');
+      for (let i = 0; i < parts.length - 1; i++) {
+        const dom = '.' + parts.slice(i).join('.');
+        document.cookie = 'hb_v2=' + base + '; Domain=' + dom;
+      }
+    }
+
+    // Proactively clear on load to ensure a fresh token replaces any stale one.
+    clearHb2Everywhere();
+
+    const params = new URLSearchParams(window.location.search);
+    const originalUrl = params.get('url') || '/';
+    const widget = document.getElementById('altchaWidget');
+    const go = () => { try { window.location.replace(originalUrl); } catch { window.location = originalUrl; } };
+
+    widget.addEventListener('altcha-success', go);
+    widget.addEventListener('altcha-verified', go);
+
+    const poll = setInterval(() => {
+      if (document.cookie && document.cookie.indexOf('hb_v2=') !== -1) {
+        clearInterval(poll);
+        go();
+      }
+    }, 150);
+
+    widget.addEventListener('altcha-error', (e) => {
+      console.error('ALTCHA error:', e.detail);
+      // Clear cookie and retry the page once to break potential loops.
+      clearHb2Everywhere();
+      setTimeout(() => { location.reload(); }, 500);
+    });
+  </script>
+</body>
+</html>

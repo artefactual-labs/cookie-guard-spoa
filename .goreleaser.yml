@@ -26,8 +26,7 @@ builds:
     mod_timestamp: "{{ .CommitTimestamp }}"
 
 archives:
-  - formats:
-      - tar.gz
+  - format: tar.gz
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
       - README.md
@@ -61,6 +60,14 @@ nfpms:
       - src: haproxy/cookie-guard-spoa.cfg
         dst: /etc/haproxy/cookie-guard-spoa.cfg
         type: config
+      # Challenge page (ALTCHA)
+      - src: web/altcha_challenge.html.lf
+        dst: /etc/haproxy/altcha_challenge.html.lf
+        type: config
+      # ALTCHA JS asset (versioned) and VERSION file; ensure these paths exist in the repo
+      - src: web/assets/altcha
+        dst: /etc/haproxy/assets/altcha
+        type: tree
     dependencies:
       - haproxy
     scripts:

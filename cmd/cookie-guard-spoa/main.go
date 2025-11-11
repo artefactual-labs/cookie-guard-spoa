@@ -33,6 +33,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -42,6 +43,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -56,6 +58,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	altcha "github.com/altcha-org/altcha-lib-go"
 )
 
 // Version is set at build time with -ldflags "-X 'main.version=...'"
@@ -63,12 +67,22 @@ var version = "dev"
 
 // CLI flags
 var (
-	listenAddr  = flag.String("listen", "127.0.0.1:9903", "SPOE listen address")
-	metricsAddr = flag.String("metrics", "127.0.0.1:9904", "Metrics/health listen address (empty to disable)")
-	secretPath  = flag.String("secret", "/etc/cookie-guard-spoa/secret.key", "Primary secret file path")
-	ttl         = flag.Duration("ttl", 1*time.Hour, "Token TTL (e.g., 1h)")
-	skew        = flag.Duration("skew", 30*time.Second, "Clock skew allowance")
-	debugMode   = flag.Bool("debug", false, "Enable verbose debug logging (for development only)")
+    listenAddr  = flag.String("listen", "127.0.0.1:9903", "SPOE listen address")
+    metricsAddr = flag.String("metrics", "127.0.0.1:9904", "Metrics/health listen address (empty to disable)")
+    secretPath  = flag.String("secret", "/etc/cookie-guard-spoa/secret.key", "Primary secret file path")
+    ttl         = flag.Duration("ttl", 1*time.Hour, "Token TTL (e.g., 1h)")
+    skew        = flag.Duration("skew", 30*time.Second, "Clock skew allowance")
+    debugMode   = flag.Bool("debug", false, "Enable verbose debug logging (for development only)")
+
+	// ALTCHA endpoints (served on the metrics listener)
+	altchaEnable     = flag.Bool("altcha", true, "Enable ALTCHA endpoints on the metrics listener")
+	altchaExpires    = flag.Duration("altcha-expires", 2*time.Minute, "ALTCHA challenge expiration window")
+	cookieSecureFlag = flag.Bool("cookie-secure", false, "Set Secure on hb_v2 cookies issued by ALTCHA verify handler")
+	altchaAssetsDir  = flag.String("altcha-assets", "/etc/haproxy/assets/altcha", "ALTCHA assets directory (serves /assets/altcha/* from here)")
+	altchaPagePath   = flag.String("altcha-page", "/etc/haproxy/altcha_challenge.html.lf", "ALTCHA challenge HTML page to serve at /altcha")
+
+    // Bind behavior
+    uaBind = flag.Bool("ua-bind", true, "Bind tokens to User-Agent; set false to ignore UA when issuing and verifying")
 )
 
 // Secret storage (atomic swap on SIGHUP)
@@ -155,24 +169,45 @@ func sign(secret []byte, payload string) []byte {
 	return h.Sum(nil)
 }
 
+func abbr(s string, n int) string {
+	if n <= 0 || len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
+// Derive a distinct HMAC key for ALTCHA from the primary secret.
+func altchaKeyFromSecret(secret []byte) []byte {
+	h := hmac.New(sha256.New, secret)
+	_, _ = io.WriteString(h, "altcha")
+	return h.Sum(nil)
+}
+
 var nowUnix = func() int64 { return time.Now().Unix() }
 
 // ---------------- token issue / verify ----------------
 
 func issueToken(ip, ua string) (token string, maxAgeSec int, err error) {
-	if ip == "" {
-		debugf("issue-token: skipping token issue for empty src-ip (ua len=%d)", len(ua))
-		return "", 0, nil
-	}
-	uah := sha1hex(ua)
-	iat := nowUnix()
-	exp := iat + int64(ttl.Seconds())
-	nonce, err := randNonce(nonceByteLen)
-	if err != nil {
-		debugf("issue-token: failed to generate nonce: %v", err)
-		return "", 0, err
-	}
-	payload := fmt.Sprintf("%s|%s|%d|%d|%s", ip, uah, iat, exp, nonce)
+    // Backwards-compatible helper: compute UA hash from string
+    return issueTokenWithUAHash(ip, sha1hex(ua))
+}
+
+// issueTokenWithUAHash issues a token using a precomputed UA SHA-1 hex hash.
+// If uaHash is empty and UA binding is disabled, the caller should pass sha1hex("").
+func issueTokenWithUAHash(ip, uaHash string) (token string, maxAgeSec int, err error) {
+    if ip == "" {
+        debugf("issue-token: skipping token issue for empty src-ip (ua_hash len=%d)", len(uaHash))
+        return "", 0, nil
+    }
+    uah := uaHash
+    iat := nowUnix()
+    exp := iat + int64(ttl.Seconds())
+    nonce, err := randNonce(nonceByteLen)
+    if err != nil {
+        debugf("issue-token: failed to generate nonce: %v", err)
+        return "", 0, err
+    }
+    payload := fmt.Sprintf("%s|%s|%d|%d|%s", ip, uah, iat, exp, nonce)
 
 	s := sec.Load()
 	if s == nil || len(s.primary) == 0 {
@@ -184,11 +219,11 @@ func issueToken(ip, ua string) (token string, maxAgeSec int, err error) {
 	sig := b64url(sign(s.primary, payload))
 
 	tok := b64url([]byte(payload)) + "." + sig
-	debugf("issue-token: issued token (len=%d maxAge=%ds ip=%s ua_sha1=%s)", len(tok), int(*ttl/time.Second), ip, uah)
+	debugf("issue-token: ip=%s ua_sha1=%s iat=%d exp=%d nonce=%s payload=%q sig_b64=%s token_len=%d maxAge=%ds",
+		ip, uah, iat, exp, nonce, payload, abbr(sig, 16), len(tok), int(*ttl/time.Second))
 
 	return tok, int(*ttl / time.Second), nil
 }
-
 
 func verifyToken(ip, ua, token string, skewSec int64) bool {
 	ok, _, _ := verifyTokenDetailed(ip, ua, token, skewSec)
@@ -196,21 +231,30 @@ func verifyToken(ip, ua, token string, skewSec int64) bool {
 }
 
 func verifyTokenDetailed(ip, ua, token string, skewSec int64) (bool, string, int64) {
+	// Backwards-compatible path: compute UA hash and delegate
+	return verifyTokenWithUAHash(ip, sha1hex(ua), token, skewSec)
+}
+
+// verifyTokenWithUAHash verifies using a precomputed UA SHA-1 hex hash.
+func verifyTokenWithUAHash(ip, uaHash, token string, skewSec int64) (bool, string, int64) {
 	if ip == "" || token == "" {
 		return false, "empty src-ip or token", 0
 	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 2 {
+		debugf("verify-token: malformed token: missing '.' separator (len=%d)", len(token))
 		return false, "token missing payload/signature separator", 0
 	}
 
 	// decode payload and signature
 	rawPayload, err := b64urldec(parts[0])
 	if err != nil {
+		debugf("verify-token: payload base64 decode failed: %v", err)
 		return false, "payload base64 decode failed", 0
 	}
 	gotSig, err := b64urldec(parts[1])
 	if err != nil {
+		debugf("verify-token: signature base64 decode failed: %v", err)
 		return false, "signature base64 decode failed", 0
 	}
 
@@ -218,22 +262,27 @@ func verifyTokenDetailed(ip, ua, token string, skewSec int64) (bool, string, int
 	payload := string(rawPayload) // ip|ua_sha1|iat|exp|nonce
 	ps := strings.Split(payload, "|")
 	if len(ps) != 5 {
+		debugf("verify-token: unexpected payload field count: got=%d payload=%q", len(ps), string(rawPayload))
 		return false, "unexpected payload field count", 0
 	}
-	tip, tuah, tiat, texp := ps[0], ps[1], ps[2], ps[3]
-	if tip != ip || tuah != sha1hex(ua) {
-		return false, "ip or ua hash mismatch", 0
-	}
+    tip, tuah, tiat, texp := ps[0], ps[1], ps[2], ps[3]
+    if tip != ip || tuah != uaHash {
+        debugf("verify-token: mismatch tip=%s ip=%s cookieUA=%s reqUAhash=%s", tip, ip, tuah, uaHash)
+        return false, "ip or ua hash mismatch", 0
+    }
 
 	var iat, exp int64
 	if _, err := fmt.Sscanf(tiat, "%d", &iat); err != nil {
+		debugf("verify-token: invalid issued-at: %q err=%v", tiat, err)
 		return false, "invalid issued-at", 0
 	}
 	if _, err := fmt.Sscanf(texp, "%d", &exp); err != nil {
+		debugf("verify-token: invalid expiration: %q err=%v", texp, err)
 		return false, "invalid expiration", 0
 	}
 	now := nowUnix()
 	if now+skewSec < iat || now-skewSec > exp {
+		debugf("verify-token: window invalid now=%d iat=%d exp=%d skew=%d", now, iat, exp, skewSec)
 		return false, "token not within validity window", 0
 	}
 
@@ -246,6 +295,7 @@ func verifyTokenDetailed(ip, ua, token string, skewSec int64) (bool, string, int
 	wantSig := sign(s.primary, payload)
 
 	if !hmac.Equal(wantSig, gotSig) {
+		debugf("verify-token: signature mismatch (ip=%s) payload=%q", ip, payload)
 		return false, "signature mismatch", 0
 	}
 
@@ -333,6 +383,7 @@ func makeHandler() func(*request.Request) {
 		if mes, err := req.Messages.GetByName("issue-token"); err == nil {
 			tStart := time.Now()
 			var ipStr, ua string
+			var uaHash string
 			if v, ok := mes.KV.Get("src-ip"); ok {
 				switch t := v.(type) {
 				case net.IP:
@@ -341,12 +392,21 @@ func makeHandler() func(*request.Request) {
 					ipStr = t
 				}
 			}
-			if v, ok := mes.KV.Get("ua"); ok {
+			if v, ok := mes.KV.Get("ua_sha1"); ok {
+				if s, ok := v.(string); ok {
+					uaHash = strings.ToLower(s)
+				}
+			} else if v, ok := mes.KV.Get("ua"); ok {
 				if s, ok := v.(string); ok {
 					ua = s
 				}
 			}
-			tok, maxAge, err := issueToken(ipStr, ua)
+			if uaBind != nil && !*uaBind {
+				uaHash = sha1hex("")
+			} else if uaHash == "" {
+				uaHash = sha1hex(ua)
+			}
+			tok, maxAge, err := issueTokenWithUAHash(ipStr, uaHash)
 			if err == nil {
 				req.Actions.SetVar(action.ScopeTransaction, "token", tok)
 				req.Actions.SetVar(action.ScopeTransaction, "max_age", fmt.Sprintf("%d", maxAge))
@@ -366,6 +426,7 @@ func makeHandler() func(*request.Request) {
 			mVerifyTotal.Inc()
 
 			var ipStr, ua, cookie string
+			var uaHash string
 			if v, ok := mes.KV.Get("src-ip"); ok {
 				switch t := v.(type) {
 				case net.IP:
@@ -374,7 +435,11 @@ func makeHandler() func(*request.Request) {
 					ipStr = t
 				}
 			}
-			if v, ok := mes.KV.Get("ua"); ok {
+			if v, ok := mes.KV.Get("ua_sha1"); ok {
+				if s, ok := v.(string); ok {
+					uaHash = strings.ToLower(s)
+				}
+			} else if v, ok := mes.KV.Get("ua"); ok {
 				if s, ok := v.(string); ok {
 					ua = s
 				}
@@ -396,18 +461,23 @@ func makeHandler() func(*request.Request) {
 				mHandlerSeconds.WithLabelValues("verify-token").Observe(time.Since(tStart).Seconds())
 				return
 			}
-			if !tokenLooksPlausible(ipStr, cookie) {
-				req.Actions.SetVar(action.ScopeTransaction, "valid", "0")
-				req.Actions.SetVar(action.ScopeTransaction, "age_seconds", ageSeconds)
-				mVerifyOutcome.WithLabelValues("invalid").Inc()
-				debugf("verify-token: guard rejected cookie due to implausible layout (ipLen=%d len=%d)", len(ipStr), len(cookie))
-				mHandlerSeconds.WithLabelValues("verify-token").Observe(time.Since(tStart).Seconds())
-				return
-			}
+        if !tokenLooksPlausible(ipStr, cookie) {
+            req.Actions.SetVar(action.ScopeTransaction, "valid", "0")
+            req.Actions.SetVar(action.ScopeTransaction, "age_seconds", ageSeconds)
+            mVerifyOutcome.WithLabelValues("invalid").Inc()
+            debugf("verify-token: guard rejected cookie due to implausible layout (ipLen=%d len=%d)", len(ipStr), len(cookie))
+            mHandlerSeconds.WithLabelValues("verify-token").Observe(time.Since(tStart).Seconds())
+            return
+        }
 
-			// Full verification
-			valid := "0"
-			if ok, reason, age := verifyTokenDetailed(ipStr, ua, cookie, int64(skew.Seconds())); ok {
+            // Full verification
+            if uaBind != nil && !*uaBind {
+                uaHash = sha1hex("")
+            } else if uaHash == "" {
+                uaHash = sha1hex(ua)
+            }
+            valid := "0"
+			if ok, reason, age := verifyTokenWithUAHash(ipStr, uaHash, cookie, int64(skew.Seconds())); ok {
 				valid = "1"
 				ageSeconds = fmt.Sprintf("%d", age)
 				mVerifyOutcome.WithLabelValues("valid").Inc()
@@ -483,6 +553,175 @@ func main() {
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte("ok\n"))
 			})
+
+			if *altchaEnable {
+				ak := altchaKeyFromSecret(sec.Load().primary)
+
+				mux.HandleFunc("/altcha-challenge", func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodGet {
+						w.Header().Set("Allow", http.MethodGet)
+						http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+						return
+					}
+					exp := time.Now().Add(*altchaExpires)
+					opts := altcha.ChallengeOptions{
+						HMACKey: string(ak),
+						Expires: &exp,
+					}
+					ch, err := altcha.CreateChallenge(opts)
+					if err != nil {
+						debugf("altcha: create challenge failed: %v", err)
+						http.Error(w, "challenge failed", http.StatusInternalServerError)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(ch)
+				})
+
+				mux.HandleFunc("/altcha-verify", func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodPost {
+						w.Header().Set("Allow", http.MethodPost)
+						http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+						return
+					}
+					type verifyReq struct {
+						Solution string `json:"solution"`
+						Payload  string `json:"payload"`
+						URL      string `json:"url"`
+					}
+					var vr verifyReq
+					if err := json.NewDecoder(r.Body).Decode(&vr); err != nil {
+						http.Error(w, "invalid json", http.StatusBadRequest)
+						return
+					}
+
+					var payload map[string]any
+					switch {
+					case vr.Payload != "":
+						// ALTCHA verifyurl sends base64 JSON as "payload"
+						var data []byte
+						if b, err := base64.StdEncoding.DecodeString(vr.Payload); err == nil {
+							data = b
+						} else if b, err := base64.RawStdEncoding.DecodeString(vr.Payload); err == nil {
+							data = b
+						} else {
+							http.Error(w, "invalid payload base64", http.StatusBadRequest)
+							return
+						}
+						if err := json.Unmarshal(data, &payload); err != nil {
+							http.Error(w, "invalid payload json", http.StatusBadRequest)
+							return
+						}
+					case vr.Solution != "":
+						if len(vr.Solution) > 0 && vr.Solution[0] == '{' {
+							if err := json.Unmarshal([]byte(vr.Solution), &payload); err != nil {
+								http.Error(w, "invalid solution json", http.StatusBadRequest)
+								return
+							}
+						} else {
+							if b, err := base64.StdEncoding.DecodeString(vr.Solution); err == nil {
+								_ = json.Unmarshal(b, &payload)
+							} else if b, err2 := base64.RawStdEncoding.DecodeString(vr.Solution); err2 == nil {
+								_ = json.Unmarshal(b, &payload)
+							}
+							if payload == nil {
+								http.Error(w, "invalid solution base64", http.StatusBadRequest)
+								return
+							}
+						}
+					default:
+						http.Error(w, "missing solution", http.StatusBadRequest)
+						return
+					}
+
+					ok, err := altcha.VerifySolution(payload, string(ak), true)
+					if err != nil || !ok {
+						debugf("altcha: verify failed: %v", err)
+						http.Error(w, "verification failed", http.StatusBadRequest)
+						return
+					}
+
+					clientIP := func() string {
+						if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+							parts := strings.Split(xff, ",")
+							return strings.TrimSpace(parts[0])
+						}
+						h, _, _ := net.SplitHostPort(r.RemoteAddr)
+						if h == "" {
+							return r.RemoteAddr
+						}
+						return h
+					}()
+					ua := r.Header.Get("User-Agent")
+					if uaBind != nil && !*uaBind {
+						ua = ""
+					}
+
+					tok, maxAge, err := issueToken(clientIP, ua)
+					if err != nil || tok == "" {
+						debugf("altcha: token issue failed: %v", err)
+						http.Error(w, "token issue failed", http.StatusInternalServerError)
+						return
+					}
+
+					cookie := &http.Cookie{
+						Name:     "hb_v2",
+						Value:    tok,
+						Path:     "/",
+						MaxAge:   maxAge,
+						Secure:   *cookieSecureFlag,
+						HttpOnly: false,
+						SameSite: http.SameSiteLaxMode,
+					}
+					http.SetCookie(w, cookie)
+					debugf("altcha: issued hb_v2 (len=%d ip=%s)", len(tok), clientIP)
+
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(`{"ok":true,"success":true}`))
+				})
+
+				// Serve the ALTCHA HTML page (from disk) at /altcha
+				mux.HandleFunc("/altcha", func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodGet {
+						w.Header().Set("Allow", http.MethodGet)
+						http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+						return
+					}
+					p := *altchaPagePath
+					f, err := os.Open(p)
+					if err != nil {
+						http.NotFound(w, r)
+						return
+					}
+					defer f.Close()
+					fi, _ := f.Stat()
+					w.Header().Set("Content-Type", "text/html; charset=utf-8")
+					w.Header().Set("Cache-Control", "no-store")
+					http.ServeContent(w, r, filepath.Base(p), fi.ModTime(), f)
+				})
+
+				// Serve the local JS asset to avoid HAProxy's buffer limits.
+				mux.HandleFunc("/assets/altcha/active/altcha.min.js", func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodGet {
+						w.Header().Set("Allow", http.MethodGet)
+						http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+						return
+					}
+					p := filepath.Join(*altchaAssetsDir, "active", "altcha.min.js")
+					f, err := os.Open(p)
+					if err != nil {
+						http.NotFound(w, r)
+						return
+					}
+					defer f.Close()
+					fi, _ := f.Stat()
+					w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+					w.Header().Set("Cache-Control", "public, max-age=604800")
+					http.ServeContent(w, r, "altcha.min.js", fi.ModTime(), f)
+				})
+			}
+
 			if err := http.ListenAndServe(*metricsAddr, mux); err != nil {
 				log.Printf("metrics server error: %v", err)
 			}
