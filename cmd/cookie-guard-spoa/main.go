@@ -67,12 +67,12 @@ var version = "dev"
 
 // CLI flags
 var (
-    listenAddr  = flag.String("listen", "127.0.0.1:9903", "SPOE listen address")
-    metricsAddr = flag.String("metrics", "127.0.0.1:9904", "Metrics/health listen address (empty to disable)")
-    secretPath  = flag.String("secret", "/etc/cookie-guard-spoa/secret.key", "Primary secret file path")
-    ttl         = flag.Duration("ttl", 1*time.Hour, "Token TTL (e.g., 1h)")
-    skew        = flag.Duration("skew", 30*time.Second, "Clock skew allowance")
-    debugMode   = flag.Bool("debug", false, "Enable verbose debug logging (for development only)")
+	listenAddr  = flag.String("listen", "127.0.0.1:9903", "SPOE listen address")
+	metricsAddr = flag.String("metrics", "127.0.0.1:9904", "Metrics/health listen address (empty to disable)")
+	secretPath  = flag.String("secret", "/etc/cookie-guard-spoa/secret.key", "Primary secret file path")
+	ttl         = flag.Duration("ttl", 1*time.Hour, "Token TTL (e.g., 1h)")
+	skew        = flag.Duration("skew", 30*time.Second, "Clock skew allowance")
+	debugMode   = flag.Bool("debug", false, "Enable verbose debug logging (for development only)")
 
 	// ALTCHA endpoints (served on the metrics listener)
 	altchaEnable     = flag.Bool("altcha", true, "Enable ALTCHA endpoints on the metrics listener")
@@ -81,8 +81,8 @@ var (
 	altchaAssetsDir  = flag.String("altcha-assets", "/etc/haproxy/assets/altcha", "ALTCHA assets directory (serves /assets/altcha/* from here)")
 	altchaPagePath   = flag.String("altcha-page", "/etc/haproxy/altcha_challenge.html.lf", "ALTCHA challenge HTML page to serve at /altcha")
 
-    // Bind behavior
-    uaBind = flag.Bool("ua-bind", true, "Bind tokens to User-Agent; set false to ignore UA when issuing and verifying")
+	// Bind behavior
+	uaBind = flag.Bool("ua-bind", true, "Bind tokens to User-Agent; set false to ignore UA when issuing and verifying")
 )
 
 // Secret storage (atomic swap on SIGHUP)
@@ -185,29 +185,31 @@ func altchaKeyFromSecret(secret []byte) []byte {
 
 var nowUnix = func() int64 { return time.Now().Unix() }
 
+const challengeLevelAltcha = "altcha"
+
 // ---------------- token issue / verify ----------------
 
 func issueToken(ip, ua string) (token string, maxAgeSec int, err error) {
-    // Backwards-compatible helper: compute UA hash from string
-    return issueTokenWithUAHash(ip, sha1hex(ua))
+	// Backwards-compatible helper: compute UA hash from string
+	return issueTokenWithUAHash(ip, sha1hex(ua))
 }
 
 // issueTokenWithUAHash issues a token using a precomputed UA SHA-1 hex hash.
 // If uaHash is empty and UA binding is disabled, the caller should pass sha1hex("").
 func issueTokenWithUAHash(ip, uaHash string) (token string, maxAgeSec int, err error) {
-    if ip == "" {
-        debugf("issue-token: skipping token issue for empty src-ip (ua_hash len=%d)", len(uaHash))
-        return "", 0, nil
-    }
-    uah := uaHash
-    iat := nowUnix()
-    exp := iat + int64(ttl.Seconds())
-    nonce, err := randNonce(nonceByteLen)
-    if err != nil {
-        debugf("issue-token: failed to generate nonce: %v", err)
-        return "", 0, err
-    }
-    payload := fmt.Sprintf("%s|%s|%d|%d|%s", ip, uah, iat, exp, nonce)
+	if ip == "" {
+		debugf("issue-token: skipping token issue for empty src-ip (ua_hash len=%d)", len(uaHash))
+		return "", 0, nil
+	}
+	uah := uaHash
+	iat := nowUnix()
+	exp := iat + int64(ttl.Seconds())
+	nonce, err := randNonce(nonceByteLen)
+	if err != nil {
+		debugf("issue-token: failed to generate nonce: %v", err)
+		return "", 0, err
+	}
+	payload := fmt.Sprintf("%s|%s|%d|%d|%s", ip, uah, iat, exp, nonce)
 
 	s := sec.Load()
 	if s == nil || len(s.primary) == 0 {
@@ -265,11 +267,11 @@ func verifyTokenWithUAHash(ip, uaHash, token string, skewSec int64) (bool, strin
 		debugf("verify-token: unexpected payload field count: got=%d payload=%q", len(ps), string(rawPayload))
 		return false, "unexpected payload field count", 0
 	}
-    tip, tuah, tiat, texp := ps[0], ps[1], ps[2], ps[3]
-    if tip != ip || tuah != uaHash {
-        debugf("verify-token: mismatch tip=%s ip=%s cookieUA=%s reqUAhash=%s", tip, ip, tuah, uaHash)
-        return false, "ip or ua hash mismatch", 0
-    }
+	tip, tuah, tiat, texp := ps[0], ps[1], ps[2], ps[3]
+	if tip != ip || tuah != uaHash {
+		debugf("verify-token: mismatch tip=%s ip=%s cookieUA=%s reqUAhash=%s", tip, ip, tuah, uaHash)
+		return false, "ip or ua hash mismatch", 0
+	}
 
 	var iat, exp int64
 	if _, err := fmt.Sscanf(tiat, "%d", &iat); err != nil {
@@ -305,6 +307,20 @@ func verifyTokenWithUAHash(ip, uaHash, token string, skewSec int64) (bool, strin
 	}
 
 	return true, "", age
+}
+
+func deriveSessionHMAC(token string) string {
+	if token == "" {
+		return ""
+	}
+	s := sec.Load()
+	if s == nil || len(s.primary) == 0 {
+		return ""
+	}
+	h := hmac.New(sha256.New, s.primary)
+	_, _ = io.WriteString(h, "cookieguard-session|")
+	_, _ = io.WriteString(h, token)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // ---------------- Negasus handler ----------------
@@ -451,6 +467,8 @@ func makeHandler() func(*request.Request) {
 			}
 
 			ageSeconds := "0"
+			sessionHMAC := ""
+			challengeLevel := ""
 
 			// Guards
 			if cookie == "" || len(cookie) > maxTokenLen || !b64urlDotRe.MatchString(cookie) {
@@ -461,25 +479,27 @@ func makeHandler() func(*request.Request) {
 				mHandlerSeconds.WithLabelValues("verify-token").Observe(time.Since(tStart).Seconds())
 				return
 			}
-        if !tokenLooksPlausible(ipStr, cookie) {
-            req.Actions.SetVar(action.ScopeTransaction, "valid", "0")
-            req.Actions.SetVar(action.ScopeTransaction, "age_seconds", ageSeconds)
-            mVerifyOutcome.WithLabelValues("invalid").Inc()
-            debugf("verify-token: guard rejected cookie due to implausible layout (ipLen=%d len=%d)", len(ipStr), len(cookie))
-            mHandlerSeconds.WithLabelValues("verify-token").Observe(time.Since(tStart).Seconds())
-            return
-        }
+			if !tokenLooksPlausible(ipStr, cookie) {
+				req.Actions.SetVar(action.ScopeTransaction, "valid", "0")
+				req.Actions.SetVar(action.ScopeTransaction, "age_seconds", ageSeconds)
+				mVerifyOutcome.WithLabelValues("invalid").Inc()
+				debugf("verify-token: guard rejected cookie due to implausible layout (ipLen=%d len=%d)", len(ipStr), len(cookie))
+				mHandlerSeconds.WithLabelValues("verify-token").Observe(time.Since(tStart).Seconds())
+				return
+			}
 
-            // Full verification
-            if uaBind != nil && !*uaBind {
-                uaHash = sha1hex("")
-            } else if uaHash == "" {
-                uaHash = sha1hex(ua)
-            }
-            valid := "0"
+			// Full verification
+			if uaBind != nil && !*uaBind {
+				uaHash = sha1hex("")
+			} else if uaHash == "" {
+				uaHash = sha1hex(ua)
+			}
+			valid := "0"
 			if ok, reason, age := verifyTokenWithUAHash(ipStr, uaHash, cookie, int64(skew.Seconds())); ok {
 				valid = "1"
 				ageSeconds = fmt.Sprintf("%d", age)
+				sessionHMAC = deriveSessionHMAC(cookie)
+				challengeLevel = challengeLevelAltcha
 				mVerifyOutcome.WithLabelValues("valid").Inc()
 				debugf("verify-token: accepted (ip=%s cookieLen=%d skew=%ds)", ipStr, len(cookie), int(skew.Seconds()))
 			} else {
@@ -488,6 +508,8 @@ func makeHandler() func(*request.Request) {
 			}
 			req.Actions.SetVar(action.ScopeTransaction, "valid", valid)
 			req.Actions.SetVar(action.ScopeTransaction, "age_seconds", ageSeconds)
+			req.Actions.SetVar(action.ScopeTransaction, "session_hmac", sessionHMAC)
+			req.Actions.SetVar(action.ScopeTransaction, "challenge_level", challengeLevel)
 			mHandlerSeconds.WithLabelValues("verify-token").Observe(time.Since(tStart).Seconds())
 		}
 	}

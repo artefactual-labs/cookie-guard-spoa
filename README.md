@@ -172,6 +172,42 @@ After editing, run `systemctl restart cookie-guard-spoa`.
        server app1 127.0.0.1:8080 check
    ```
 
+   When HAProxy runs the `verify-token` message, the agent populates the following transaction-scoped variables (prefixed via `option var-prefix cookieguard`):
+
+   - `txn.cookieguard.valid`: `"1"` when the hb_v2 cookie validates, otherwise `"0"`.
+   - `txn.cookieguard.age_seconds`: age of the accepted cookie (stringified integer seconds).
+   - `txn.cookieguard.session_hmac`: HMAC handle derived from the cookie value for downstream session tracking (empty when invalid or missing).
+   - `txn.cookieguard.challenge_level`: textual label for the challenge that produced the cookie (currently `"altcha"` for hb_v2).
+
+## SPOE inputs and outputs
+
+The agent exchanges two SPOE messages with HAProxy: `issue-token` (fires when a client needs a new cookie) and `verify-token` (fires to validate an existing cookie). Each message has a small, well-defined contract:
+
+### Inputs (message arguments)
+
+| Message | Arg | Required | Description |
+| --- | --- | --- | --- |
+| `issue-token` | `src-ip` | yes | Client IP used to bind and sign the issued token. Pass either `ip.src` (L4) or a header-derived value that reflects the real client. |
+| `issue-token` | `ua` or `ua_sha1` | optional | User-Agent binding. Provide the full header via `req.fhdr(User-Agent)` or a pre-hashed SHA-1 (hex, lower-case) in `ua_sha1`. When omitted the agent hashes the provided `ua`; disable binding entirely via `-ua-bind=false`. |
+| `verify-token` | `src-ip` | yes | Must match the IP used at issuance so the token layout check and signature succeed. |
+| `verify-token` | `ua` or `ua_sha1` | optional | Same semantics as on issuance; using `ua_sha1` avoids re-hashing in the agent. |
+| `verify-token` | `cookie` | yes | The raw `hb_v2` cookie value (e.g. `req.cook(hb_v2)`). Tokens longer than 8 KB or not matching the expected format are rejected early.
+
+All inputs beyond those listed are ignored. If you cannot provide a reliable `ua`, set `-ua-bind=false` so the agent automatically treats the UA hash as empty.
+
+### Outputs (transaction variables)
+
+With `option var-prefix cookieguard`, HAProxy sees the following variables under `var(txn.cookieguard.<name>)`:
+
+- `token` (string, optional): set by `issue-token` when a fresh cookie was minted. Empty when issuance fails or is skipped; typically used to write `Set-Cookie` headers inside HAProxy.
+- `max_age` (integer-as-string, optional): TTL in seconds paired with `token`. Only meaningful when `token` is non-empty.
+- `valid` (`"1"`/`"0"`, always set by `verify-token`): indicates whether the presented cookie passed validation. Useful for quick ACLs (`var(txn.cookieguard.valid) -m str 1`).
+- `age_seconds` (stringified integer, always set): age of the accepted cookie. Remains "0" for invalid/missing cookies. You can rate-limit or log based on freshness.
+- `session_hmac` (hex string, optional): deterministic HMAC derived from the hb_v2 payload. Decision-SPOA uses this value as `cookieguard_session` to correlate sessions without exposing the token itself. Empty when validation fails.
+- `challenge_level` (string, optional): label describing how the cookie originated. Currently always `"altcha"` when verification succeeds; keep space for future challenge types.
+
+By design, `verify-token` always resets every output to a safe default before attempting validation so stale data never leaks between transactions.
+
 4. **ALTCHA challenge (default)**
 
    ALTCHA is the recommended challenge. The agent exposes two endpoints on the metrics HTTP port when `-altcha` is enabled (default: on):
