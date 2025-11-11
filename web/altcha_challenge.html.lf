@@ -79,13 +79,33 @@
       }
     }
 
+    function extractOriginalUrl() {
+      const search = window.location.search;
+      if (!search) return '/';
+      const idx = search.indexOf('url=');
+      if (idx === -1) return '/';
+      const raw = search.slice(idx + 4);
+      if (!raw) return '/';
+      try {
+        return decodeURIComponent(raw);
+      } catch (err) {
+        console.warn('ALTCHA: failed to decode url param, using raw value', err);
+        return raw;
+      }
+    }
+
     // Proactively clear on load to ensure a fresh token replaces any stale one.
     clearHb2Everywhere();
 
-    const params = new URLSearchParams(window.location.search);
-    const originalUrl = params.get('url') || '/';
+    const originalUrl = extractOriginalUrl();
     const widget = document.getElementById('altchaWidget');
-    const go = () => { try { window.location.replace(originalUrl); } catch { window.location = originalUrl; } };
+    const go = () => {
+      try {
+        window.location.replace(originalUrl);
+      } catch {
+        window.location = originalUrl;
+      }
+    };
 
     widget.addEventListener('altcha-success', go);
     widget.addEventListener('altcha-verified', go);
