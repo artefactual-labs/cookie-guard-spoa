@@ -43,4 +43,13 @@ if [ -f "$ALTCHA_DIR/VERSION" ]; then
   fi
 fi
 
+# Ensure BotD assets symlink points to packaged version, if present
+BOTD_DIR="/etc/haproxy/assets/botd"
+if [ -f "$BOTD_DIR/VERSION" ]; then
+  BOTD_VER=$(head -n1 "$BOTD_DIR/VERSION" 2>/dev/null || true)
+  if [ -n "$BOTD_VER" ] && [ -d "$BOTD_DIR/$BOTD_VER" ]; then
+    ln -sfn "$BOTD_VER" "$BOTD_DIR/active"
+  fi
+fi
+
 exit 0

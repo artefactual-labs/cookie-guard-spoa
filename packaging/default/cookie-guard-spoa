@@ -10,7 +10,8 @@ COOKIE_GUARD_SPOA_OPTS="\
   -skew 30s \
   -altcha-assets /etc/haproxy/assets/altcha \
   -altcha-page /etc/haproxy/altcha_challenge.html.lf \
-  -altcha-expires 2m"
+  -altcha-expires 2m \
+  -botd-assets /etc/haproxy/assets/botd"
 
 # Optional toggles. Uncomment to enable.
 #COOKIE_GUARD_FLAG_DEBUG="-debug"
@@ -19,6 +20,7 @@ COOKIE_GUARD_FLAG_COOKIE_SECURE="-cookie-secure"
 # Ignore User-Agent binding (use only IP+iat+exp+nonce)
 #COOKIE_GUARD_FLAG_NO_UA_BIND="-ua-bind=false"
 #COOKIE_GUARD_FLAG_ALTCHA_DISABLE="-altcha=false"   # disable ALTCHA endpoints
+#COOKIE_GUARD_FLAG_BOTD_DISABLE="-botd=false"       # disable BotD ingestion endpoint
 
 # Extra flags (advanced). Example: -listen 0.0.0.0:9903
 #COOKIE_GUARD_FLAG_EXTRA=""

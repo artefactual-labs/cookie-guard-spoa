@@ -63,7 +63,7 @@
     <div class="brand">Powered by <a href="https://altcha.org" rel="noopener noreferrer" target="_blank">ALTCHA</a></div>
   </div>
 
-  <script>
+  <script type="module">
     // Clear any stale hb_v2 cookies across common domain variants to avoid loops
     // when topology changes (e.g., extra proxy) cause old tokens to fail.
     function clearHb2Everywhere() {
@@ -98,7 +98,12 @@
     clearHb2Everywhere();
 
     const originalUrl = extractOriginalUrl();
+    const statusHeading = document.querySelector('.row h1');
+    const statusBody = document.querySelector('.row p');
+    const hintEl = document.querySelector('.hint');
+    const brandEl = document.querySelector('.brand');
     const widget = document.getElementById('altchaWidget');
+    let pollTimer = null;
     const go = () => {
       try {
         window.location.replace(originalUrl);
@@ -107,12 +112,133 @@
       }
     };
 
+    async function sha1Hex(value) {
+      try {
+        const data = new TextEncoder().encode(value || '');
+        const hash = await crypto.subtle.digest('SHA-1', data);
+        return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, '0')).join('');
+      } catch (err) {
+        console.warn('BotD: unable to hash UA', err);
+        return '';
+      }
+    }
+
+    function normalizeBotdResult(value) {
+      if (!value) return 'suspect';
+      const v = value.toLowerCase();
+      if (v === 'bad') return 'bad';
+      if (v === 'good') return 'good';
+      return 'suspect';
+    }
+
+    function blockDueToBotd() {
+      if (widget) {
+        widget.remove();
+      }
+      if (pollTimer) {
+        clearInterval(pollTimer);
+      }
+      statusHeading.textContent = 'Request blocked';
+      statusBody.textContent = 'Your browser looks automated. If this is a mistake, contact support.';
+      if (hintEl) {
+        hintEl.textContent = 'Automation fingerprints were detected (BotD).';
+      }
+      const details = document.createElement('div');
+      details.className = 'hint';
+      details.textContent = 'Reference: BotD verdict BAD';
+      brandEl.insertAdjacentElement('beforebegin', details);
+    }
+
+    const botdVerdictBad = 'bad';
+    const botdVerdictGood = 'good';
+
+    function firstTriggeredDetector(details) {
+      if (!details) return '';
+      try {
+        for (const [name, info] of Object.entries(details)) {
+          if (info && typeof info === 'object' && info.bot) {
+            return name;
+          }
+        }
+      } catch (err) {
+        console.warn('BotD: unable to inspect detectors', err);
+      }
+      return '';
+    }
+
+    function buildBotdPayload(result, details) {
+      const payload = {
+        verdict: 'suspect',
+        botKind: '',
+        confidence: 0,
+        requestId: result?.requestId || result?.bot?.requestId || ''
+      };
+
+      if (!result) {
+        return payload;
+      }
+
+      if (typeof result.bot === 'object' && result.bot !== null) {
+        payload.verdict = normalizeBotdResult(result.bot.result);
+        payload.botKind = result.bot.result ? (result.bot.type || firstTriggeredDetector(details) || '') : '';
+        payload.confidence = result.bot.probability || 0;
+        payload.requestId = result.bot.requestId || payload.requestId;
+        return payload;
+      }
+
+      if (typeof result.bot === 'boolean') {
+        payload.verdict = result.bot ? botdVerdictBad : botdVerdictGood;
+        payload.botKind = result.bot ? (result.botKind || firstTriggeredDetector(details) || '') : '';
+        payload.confidence = result.bot ? 1 : 0;
+        return payload;
+      }
+
+      return payload;
+    }
+
+    async function reportBotd(result, details) {
+      const payload = buildBotdPayload(result, details);
+      payload.ua_hash = await sha1Hex(navigator.userAgent || '');
+      try {
+        const response = await fetch('/botd-report', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify(payload)
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+      } catch (err) {
+        console.warn('BotD: report failed', err);
+      }
+      return payload.verdict;
+    }
+
+    async function runBotd() {
+      try {
+        const mod = await import('/assets/botd/active/botd.esm.js');
+        const botdLib = mod.default || mod;
+        const botd = await botdLib.load();
+        const detection = await botd.detect();
+        const detections = typeof botd.getDetections === 'function' ? botd.getDetections() : null;
+        const verdict = await reportBotd(detection, detections);
+        if (verdict === 'bad') {
+          blockDueToBotd();
+        }
+      } catch (err) {
+        console.warn('BotD: detection disabled', err);
+      }
+    }
+
+    runBotd();
+
     widget.addEventListener('altcha-success', go);
     widget.addEventListener('altcha-verified', go);
 
-    const poll = setInterval(() => {
+    pollTimer = setInterval(() => {
       if (document.cookie && document.cookie.indexOf('hb_v2=') !== -1) {
-        clearInterval(poll);
+        clearInterval(pollTimer);
         go();
       }
     }, 150);

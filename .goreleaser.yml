@@ -68,6 +68,10 @@ nfpms:
       - src: web/assets/altcha
         dst: /etc/haproxy/assets/altcha
         type: tree
+      # BotD JS asset (versioned) and VERSION file; served via /assets/botd/active/botd.esm.js
+      - src: web/assets/botd
+        dst: /etc/haproxy/assets/botd
+        type: tree
     dependencies:
       - haproxy
     scripts:
