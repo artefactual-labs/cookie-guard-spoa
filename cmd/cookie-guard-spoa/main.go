@@ -47,6 +47,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -80,6 +81,12 @@ var (
 	cookieSecureFlag = flag.Bool("cookie-secure", false, "Set Secure on hb_v2 cookies issued by ALTCHA verify handler")
 	altchaAssetsDir  = flag.String("altcha-assets", "/etc/haproxy/assets/altcha", "ALTCHA assets directory (serves /assets/altcha/* from here)")
 	altchaPagePath   = flag.String("altcha-page", "/etc/haproxy/altcha_challenge.html.lf", "ALTCHA challenge HTML page to serve at /altcha")
+
+	// BotD ingestion
+	botdEnable    = flag.Bool("botd", true, "Enable BotD report ingestion endpoint")
+	botdTTL       = flag.Duration("botd-ttl", 5*time.Minute, "BotD verdict retention window")
+	botdCacheMax  = flag.Int("botd-cache-max", 100000, "Maximum BotD cache entries (0 disables storage)")
+	botdAssetsDir = flag.String("botd-assets", "/etc/haproxy/assets/botd", "BotD assets directory (serves /assets/botd/* from here)")
 
 	// Bind behavior
 	uaBind = flag.Bool("ua-bind", true, "Bind tokens to User-Agent; set false to ignore UA when issuing and verifying")
@@ -119,6 +126,28 @@ var (
 			Help: "Build information",
 		},
 		[]string{"version"},
+	)
+
+	mBotdReports = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "cookie_guard_botd_reports_total",
+			Help: "Total number of BotD reports by verdict",
+		},
+		[]string{"verdict"},
+	)
+
+	mBotdCacheEntries = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "cookie_guard_botd_cache_entries",
+			Help: "Number of active BotD verdicts stored in memory",
+		},
+	)
+
+	mBotdCacheEvictions = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "cookie_guard_botd_cache_evictions_total",
+			Help: "Number of BotD cache entries evicted due to expiration or capacity",
+		},
 	)
 )
 
@@ -186,6 +215,133 @@ func altchaKeyFromSecret(secret []byte) []byte {
 var nowUnix = func() int64 { return time.Now().Unix() }
 
 const challengeLevelAltcha = "altcha"
+
+// ---------------- BotD verdict cache ----------------
+
+const (
+	botdVerdictBad     = "bad"
+	botdVerdictGood    = "good"
+	botdVerdictSuspect = "suspect"
+)
+
+type botdVerdictEntry struct {
+	Verdict    string
+	BotKind    string
+	Confidence float64
+	RequestID  string
+	Expires    time.Time
+}
+
+var (
+	botdMu    sync.Mutex
+	botdCache = make(map[string]botdVerdictEntry)
+)
+
+func clientIPFromRequest(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		return strings.TrimSpace(parts[0])
+	}
+	h, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if h == "" {
+		return r.RemoteAddr
+	}
+	return h
+}
+
+func normalizeBotdVerdict(v string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "bad":
+		return botdVerdictBad, true
+	case "good":
+		return botdVerdictGood, true
+	case "notdetected", "not_detected", "unknown", "suspect":
+		return botdVerdictSuspect, true
+	default:
+		return "", false
+	}
+}
+
+func botdKey(ip, uaHash string) string {
+	return ip + "|" + uaHash
+}
+
+func pruneBotdLocked(now time.Time) {
+	for k, entry := range botdCache {
+		if now.After(entry.Expires) {
+			delete(botdCache, k)
+			mBotdCacheEvictions.Inc()
+		}
+	}
+	mBotdCacheEntries.Set(float64(len(botdCache)))
+}
+
+func storeBotdVerdict(ip, uaHash string, entry botdVerdictEntry) {
+	if ip == "" || uaHash == "" {
+		return
+	}
+	if botdCacheMax != nil && *botdCacheMax == 0 {
+		return
+	}
+	key := botdKey(ip, uaHash)
+	if botdCache == nil {
+		botdCache = make(map[string]botdVerdictEntry)
+	}
+	botdMu.Lock()
+	defer botdMu.Unlock()
+
+	now := time.Now()
+	pruneBotdLocked(now)
+
+	if botdCacheMax != nil && *botdCacheMax > 0 {
+		for len(botdCache) >= *botdCacheMax {
+			for k := range botdCache {
+				delete(botdCache, k)
+				mBotdCacheEvictions.Inc()
+				break
+			}
+		}
+	}
+
+	botdCache[key] = entry
+	mBotdCacheEntries.Set(float64(len(botdCache)))
+	debugf("botd: cached verdict=%s bot_kind=%s ip=%s ua_hash=%s expires=%s", entry.Verdict, entry.BotKind, ip, uaHash, entry.Expires.Format(time.RFC3339))
+}
+
+func lookupBotdVerdict(ip, uaHash string) (botdVerdictEntry, bool) {
+	if ip == "" || uaHash == "" || botdCache == nil {
+		return botdVerdictEntry{}, false
+	}
+	key := botdKey(ip, uaHash)
+	botdMu.Lock()
+	defer botdMu.Unlock()
+
+	now := time.Now()
+	pruneBotdLocked(now)
+
+	entry, ok := botdCache[key]
+	if !ok {
+		return botdVerdictEntry{}, false
+	}
+	if now.After(entry.Expires) {
+		delete(botdCache, key)
+		mBotdCacheEntries.Set(float64(len(botdCache)))
+		mBotdCacheEvictions.Inc()
+		return botdVerdictEntry{}, false
+	}
+	debugf("botd: cache hit verdict=%s bot_kind=%s ip=%s ua_hash=%s", entry.Verdict, entry.BotKind, ip, uaHash)
+	return entry, true
+}
+
+func clampConfidence(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
 
 // ---------------- token issue / verify ----------------
 
@@ -393,6 +549,23 @@ func tokenLooksPlausible(ip, token string) bool {
 	return false
 }
 
+func setBotdVars(req *request.Request, entry botdVerdictEntry, ok bool) {
+	scope := action.ScopeTransaction
+	req.Actions.SetVar(scope, "botd_verdict", "")
+	req.Actions.SetVar(scope, "botd_tool", "")
+	req.Actions.SetVar(scope, "botd_kind", "")
+	req.Actions.SetVar(scope, "botd_confidence", "")
+	req.Actions.SetVar(scope, "botd_request_id", "")
+	if !ok {
+		return
+	}
+	req.Actions.SetVar(scope, "botd_verdict", entry.Verdict)
+	req.Actions.SetVar(scope, "botd_tool", entry.BotKind) // legacy name for compatibility
+	req.Actions.SetVar(scope, "botd_kind", entry.BotKind)
+	req.Actions.SetVar(scope, "botd_confidence", fmt.Sprintf("%.3f", entry.Confidence))
+	req.Actions.SetVar(scope, "botd_request_id", entry.RequestID)
+}
+
 func makeHandler() func(*request.Request) {
 	return func(req *request.Request) {
 		// "issue-token"
@@ -422,6 +595,9 @@ func makeHandler() func(*request.Request) {
 			} else if uaHash == "" {
 				uaHash = sha1hex(ua)
 			}
+
+			entry, found := lookupBotdVerdict(ipStr, uaHash)
+			setBotdVars(req, entry, found)
 			tok, maxAge, err := issueTokenWithUAHash(ipStr, uaHash)
 			if err == nil {
 				req.Actions.SetVar(action.ScopeTransaction, "token", tok)
@@ -494,6 +670,10 @@ func makeHandler() func(*request.Request) {
 			} else if uaHash == "" {
 				uaHash = sha1hex(ua)
 			}
+
+			entry, found := lookupBotdVerdict(ipStr, uaHash)
+			setBotdVars(req, entry, found)
+
 			valid := "0"
 			if ok, reason, age := verifyTokenWithUAHash(ipStr, uaHash, cookie, int64(skew.Seconds())); ok {
 				valid = "1"
@@ -565,7 +745,7 @@ func main() {
 
 	// Metrics server
 	if *metricsAddr != "" {
-		prometheus.MustRegister(mIssueTotal, mVerifyTotal, mVerifyOutcome, mHandlerSeconds, mBuildInfo)
+		prometheus.MustRegister(mIssueTotal, mVerifyTotal, mVerifyOutcome, mHandlerSeconds, mBuildInfo, mBotdReports, mBotdCacheEntries, mBotdCacheEvictions)
 		mBuildInfo.WithLabelValues(version).Set(1)
 
 		go func() {
@@ -741,6 +921,93 @@ func main() {
 					w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 					w.Header().Set("Cache-Control", "public, max-age=604800")
 					http.ServeContent(w, r, "altcha.min.js", fi.ModTime(), f)
+				})
+			}
+
+			if *botdEnable {
+				mux.HandleFunc("/assets/botd/active/botd.esm.js", func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodGet {
+						w.Header().Set("Allow", http.MethodGet)
+						http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+						return
+					}
+					p := filepath.Join(*botdAssetsDir, "active", "botd.esm.js")
+					f, err := os.Open(p)
+					if err != nil {
+						http.NotFound(w, r)
+						return
+					}
+					defer f.Close()
+					fi, _ := f.Stat()
+					w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+					w.Header().Set("Cache-Control", "public, max-age=604800")
+					http.ServeContent(w, r, "botd.esm.js", fi.ModTime(), f)
+				})
+
+				mux.HandleFunc("/botd-report", func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodPost {
+						w.Header().Set("Allow", http.MethodPost)
+						http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+						return
+					}
+					defer r.Body.Close()
+					var reqBody struct {
+						Verdict    string  `json:"verdict"`
+						BotKind    string  `json:"botKind"`
+						Tool       string  `json:"tool"` // legacy
+						Confidence float64 `json:"confidence"`
+						RequestID  string  `json:"requestId"`
+						UaHash     string  `json:"ua_hash"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+						http.Error(w, "invalid json", http.StatusBadRequest)
+						return
+					}
+
+					verdict, ok := normalizeBotdVerdict(reqBody.Verdict)
+					if !ok {
+						http.Error(w, "invalid verdict", http.StatusBadRequest)
+						return
+					}
+
+					clientIP := clientIPFromRequest(r)
+					if clientIP == "" {
+						http.Error(w, "missing client ip", http.StatusBadRequest)
+						return
+					}
+
+					ua := r.Header.Get("User-Agent")
+					uaHash := strings.ToLower(strings.TrimSpace(reqBody.UaHash))
+					if uaHash == "" {
+						if uaBind != nil && !*uaBind {
+							uaHash = sha1hex("")
+						} else {
+							uaHash = sha1hex(ua)
+						}
+					}
+					if uaHash == "" {
+						http.Error(w, "missing ua hash", http.StatusBadRequest)
+						return
+					}
+
+					botKind := strings.TrimSpace(reqBody.BotKind)
+					if botKind == "" {
+						botKind = strings.TrimSpace(reqBody.Tool)
+					}
+
+					entry := botdVerdictEntry{
+						Verdict:    verdict,
+						BotKind:    botKind,
+						Confidence: clampConfidence(reqBody.Confidence),
+						RequestID:  strings.TrimSpace(reqBody.RequestID),
+						Expires:    time.Now().Add(*botdTTL),
+					}
+					storeBotdVerdict(clientIP, uaHash, entry)
+					mBotdReports.WithLabelValues(verdict).Inc()
+
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(`{"ok":true}`))
 				})
 			}
 
